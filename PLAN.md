@@ -74,11 +74,50 @@ terraform/
 
 **Control plane VM** (static — deployed once, never auto-scaled):
 - `proxmox_virtual_environment_vm.controlplane`
-- Fixed CPU/RAM (e.g. 4 CPU, 8 GB RAM)
+- Fixed CPU/RAM (e.g. 4 CPU, 8 GB RAM), always on a designated node
 
-**Worker VM** (dynamic — this is what deploy/remove/resize actions target):
-- `proxmox_virtual_environment_vm.worker` with `count` or `for_each`
-- Parameterised: `var.worker_count`, `var.worker_memory`, `var.worker_cores`
+**Worker VM** (dynamic):
+- `proxmox_virtual_environment_vm.worker` using `for_each` over a **map**, not `count`
+- The map key is the worker's name (e.g. `worker-pve2-01`), the value contains its target Proxmox node, memory, and cores
+- Using a map means adding or removing one worker does not cause Terraform to recreate others — it operates only on the changed key
+- **Never use `count` for workers** — count-based resources are index-dependent, so removing worker index 1 causes Terraform to shift and recreate workers 2, 3, etc.
+
+### Worker Naming Convention
+
+Workers must be named to encode which Proxmox node they live on:
+```
+worker-<proxmox-node>-<sequence>
+e.g. worker-pve2-01, worker-pve2-02, worker-pve1-01
+```
+
+This naming convention serves three purposes:
+1. The deploy-worker workflow can count workers per node by querying `qm list` or the Proxmox API and filtering by name prefix
+2. The remove-worker workflow knows exactly which Proxmox node to target for VM destruction without querying state
+3. `kubectl get nodes` output shows which Proxmox host each k8s worker is backed by
+
+### Multi-Node Placement Strategy
+
+When your Proxmox environment spans multiple physical nodes (pve1, pve2, pve3...), each with different resource capacity, the deploy-worker workflow must decide WHERE to place a new VM before calling Terraform.
+
+**Node capacity config** — stored in `terraform/node_capacities.json` (tracked in Git):
+- A map of each Proxmox node name to its maximum allowed worker VMs
+- Example: `pve1=3, pve2=6, pve3=4, pve4=2`
+- These limits represent practical capacity (RAM headroom, CPU cores, storage), not hard Proxmox limits — you define them based on your hardware
+
+**Placement algorithm (runs in the deploy-worker workflow before Terraform):**
+1. Read `node_capacities.json` from the repo
+2. Query the Proxmox API for each node: `GET /api2/json/nodes/{node}/qemu` — returns all VMs on that node
+3. Filter the response to count only VMs whose names match the worker naming pattern (`worker-{node}-*`)
+4. For each node: calculate `remaining = max_capacity - current_worker_count`
+5. Select the node with the **highest remaining capacity**
+6. Tiebreak rule: if two nodes have equal remaining capacity, prefer the one with the higher `max_capacity` value (it has more headroom overall)
+7. If ALL nodes are at their max: fail the workflow with a descriptive error — do not attempt to place the VM
+
+**Why highest remaining rather than first available:**
+Placing on the node with the most headroom distributes load evenly across Proxmox hosts, avoiding a scenario where pve2 fills up while pve3 sits idle.
+
+**Proxmox API for VM listing:** https://pve.proxmox.com/pve-docs/api-viewer/#/nodes/{node}/qemu
+**bpg/proxmox data source (alternative — query via Terraform):** https://registry.terraform.io/providers/bpg/proxmox/latest/docs/data-sources/virtual_environment_vms
 
 **Terraform docs:** https://registry.terraform.io/providers/bpg/proxmox/latest/docs
 
@@ -356,14 +395,20 @@ This section describes what each workflow does at a logical level so you can bui
 
 **Steps:**
 1. Checkout repo
-2. Authenticate to Terraform state backend (see Layer 7)
-3. Query current `worker_count` from Terraform state
-4. Run `terraform apply` with `worker_count + 1`
-   - Terraform creates a new Proxmox VM from template
+2. Authenticate to Terraform state backend
+3. **Run placement selection** (before any Terraform call):
+   - Read `terraform/node_capacities.json`
+   - Query Proxmox API `GET /nodes/{node}/qemu` for each node
+   - Count worker VMs per node (filter by name pattern)
+   - Calculate remaining capacity per node
+   - Select node with highest remaining; fail if all nodes are at max
+4. Derive the new worker name: `worker-{selected_node}-{next_sequence}`
+   - Next sequence = current highest sequence on that node + 1
+5. Run `terraform apply` passing the updated workers map (new entry added with selected node and default memory/cores)
+   - Terraform creates the VM on the selected Proxmox node
    - Outputs the new VM's IP address
-5. Run Ansible `site.yml` targeting only the new VM
-   - Configures OS, installs k8s, runs `kubeadm join`
-6. Verify node is `Ready` via `kubectl get nodes`
+6. Run Ansible `site.yml` targeting only the new VM
+7. Verify node is `Ready` via `kubectl get nodes`
 
 ---
 

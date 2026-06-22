@@ -162,9 +162,57 @@ Install all CLI tools on your local machine before touching Proxmox.
 
 ## Phase 5: Terraform — Infrastructure Definition
 
+### 5a: Node Capacity Configuration (Multi-Node Placement)
+
+> Before writing any Terraform, you must define how workers are distributed across your Proxmox nodes. This config drives all placement decisions at deploy time.
+
+**Step 5a.1 — Inventory your Proxmox nodes and their practical worker capacity**
+> For each Proxmox node (pve1, pve2, pve3, pve4...), determine the maximum number of worker VMs it can comfortably host given its physical RAM, CPU cores, and storage.
+> This is NOT Proxmox's hard limit — it is YOUR defined ceiling. Example: a node with 64 GB RAM running other VMs might have practical capacity for 3 workers at 8 GB each.
+> Write these limits down before proceeding.
+
+**Step 5a.2 — Create `terraform/node_capacities.json`**
+> Create a JSON file in the repo (committed to Git) that maps each Proxmox node name to its max worker count.
+> Example structure: `{ "pve1": 3, "pve2": 6, "pve3": 4, "pve4": 2 }`
+> This file is the single source of truth for placement decisions. Changing a node's capacity is a Git commit — it is auditable and versioned.
+> This file is READ by the deploy-worker GitHub Actions workflow before calling Terraform. Terraform itself does not read it — it just receives the already-decided target node as a variable.
+
+**Step 5a.3 — Decide on and document the worker naming convention**
+> Workers must be named to encode the Proxmox node they live on.
+> Recommended pattern: `worker-{proxmox-node}-{zero-padded-sequence}`
+> Examples: `worker-pve2-01`, `worker-pve2-02`, `worker-pve1-01`
+> Document this in a comment in `terraform/worker.tf` so the pattern is obvious when reading Terraform.
+> This naming is how the placement algorithm counts current workers per node — it parses the node name out of the VM name, so the pattern must be consistent.
+
+**Step 5a.4 — Understand the placement selection algorithm**
+> The deploy-worker workflow will run this logic before every Terraform apply:
+>
+> 1. Read `terraform/node_capacities.json` — produces a map of `{node: max}`
+> 2. For each node in the map, call the Proxmox API: `GET /api2/json/nodes/{node}/qemu`
+>    - Filter the returned VM list to count only VMs whose names match `worker-{node}-*`
+>    - This gives `current_count` per node
+>    - Proxmox API reference: https://pve.proxmox.com/pve-docs/api-viewer/#/nodes/{node}/qemu
+> 3. For each node: `remaining = max - current_count`
+> 4. Select the node with the **highest remaining value**
+> 5. Tiebreak: if two nodes have equal remaining, pick the one with the higher `max` (more capable host)
+> 6. If all nodes have `remaining = 0`: fail the workflow immediately with a clear error message — do not proceed to Terraform
+> 7. Derive the new worker name: find the highest existing sequence number for that node from the Proxmox API response, increment by 1, zero-pad to 2 digits
+
+**Step 5a.5 — Verify the Proxmox API is queryable from the self-hosted runner**
+> From the runner VM (Phase 3), use curl to call `GET /api2/json/nodes/{node}/qemu` with your API token.
+> Confirm you get a JSON array of VM objects back, each with a `name` field.
+> This is the exact call the workflow will make — confirming it works here prevents silent failures later.
+> Proxmox API auth reference: https://pve.proxmox.com/wiki/Proxmox_VE_API#Authentication
+
+---
+
+### 5b: Terraform File Definitions
+
 **Step 5.1 — Write `terraform/variables.tf`**
-> Define all input variables: Proxmox API URL, token ID, token secret (marked sensitive), node name, template name, control plane specs (CPU/memory/disk), worker count, worker CPU, worker memory, worker disk, SSH public key content, VM network bridge name, VM IP prefix.
-> Do not hardcode values — every environment-specific value should be a variable.
+> Define all input variables: Proxmox API URL, token ID, token secret (marked sensitive), template name, control plane node name, control plane specs (CPU/memory/disk), SSH public key content, VM network bridge name.
+> **The workers variable is a map of objects** — key is the worker name (e.g. `worker-pve2-01`), value contains: `node` (Proxmox node name), `memory` (MB), `cores`, `disk_size`.
+> Remove any `worker_count` simple integer variable — the map is the new interface.
+> Do not hardcode values — every environment-specific setting is a variable.
 
 **Step 5.2 — Write `terraform/main.tf`**
 > Configure the `bpg/proxmox` provider using variables for the API URL and credentials.
@@ -173,34 +221,40 @@ Install all CLI tools on your local machine before touching Proxmox.
 **Step 5.3 — Write `terraform/controlplane.tf`**
 > Define the `proxmox_virtual_environment_vm` resource for the control plane node.
 > Configure: clone from your template, set CPU/memory, inject SSH public key via cloud-init, set hostname via cloud-init, assign static IP.
+> The control plane always goes on a specific designated node — hardcode this or use a dedicated variable.
 > Reference: https://registry.terraform.io/providers/bpg/proxmox/latest/docs/resources/virtual_environment_vm
 
 **Step 5.4 — Write `terraform/worker.tf`**
-> Define the worker VM resource using `for_each` over a map variable where each key is a worker name and the value contains its specific CPU/memory/disk settings.
-> Using a map (not `count`) is important — it lets you modify a single worker's memory without Terraform wanting to recreate all workers.
-> Reference for for_each pattern: https://developer.hashicorp.com/terraform/language/meta-arguments/for_each
+> Define the worker VM resource using `for_each` over the workers map variable.
+> Each iteration uses `each.key` as the VM name (e.g. `worker-pve2-01`) and `each.value.node` as the target Proxmox node.
+> Each worker's memory and cores come from `each.value.memory` and `each.value.cores` — this is what makes individual vertical scaling possible without touching other workers.
+> **Why map over count:** with `count`, removing worker index 1 causes Terraform to shift and want to recreate workers 2, 3, etc. With `for_each` on a map, adding or removing `worker-pve2-02` only touches that one resource.
+> Reference: https://developer.hashicorp.com/terraform/language/meta-arguments/for_each
 
 **Step 5.5 — Write `terraform/outputs.tf`**
-> Output the control plane IP and a map of worker names to IPs.
+> Output the control plane IP and a map of worker names to their IPs.
+> Also output a map of worker names to their Proxmox node — useful for the remove-worker workflow to confirm which node to target.
 > These outputs are consumed by Ansible to build the inventory dynamically.
 
 **Step 5.6 — Create a `terraform/terraform.tfvars` (local only, gitignored)**
-> Populate with your actual Proxmox URL, token ID, token secret, SSH public key.
+> Populate with your actual Proxmox URL, token ID, token secret, SSH public key, and the initial workers map (your first worker entry).
 > This file must never be committed — it contains secrets.
-> For GitHub Actions, these values come from GitHub Secrets injected as environment variables.
+> For GitHub Actions, the workers map is passed as a JSON environment variable.
 
 **Step 5.7 — Run `terraform init` locally**
-> This downloads the bpg/proxmox provider and connects to Terraform Cloud as the state backend.
+> Downloads the bpg/proxmox provider and connects to Terraform Cloud as the state backend.
 > Verify it authenticates successfully and the workspace is initialised.
 
 **Step 5.8 — Run `terraform plan` locally**
-> Review the execution plan — confirm it will create the control plane VM and the initial worker VM(s).
+> Review the execution plan — confirm it will create the control plane VM and the first worker VM on the correct Proxmox node.
+> Check that the worker name in the plan matches your naming convention.
 > Fix any validation errors before applying.
 
 **Step 5.9 — Run `terraform apply` locally (first manual apply)**
 > This is the only manual Terraform apply — after this, all applies go through GitHub Actions.
-> Confirm VMs appear in Proxmox UI and are booting.
+> Confirm VMs appear in the Proxmox UI under the correct node.
 > Confirm IPs appear in `terraform output`.
+> Confirm the worker VM name in Proxmox matches the naming convention.
 
 ---
 
@@ -417,27 +471,49 @@ Install all CLI tools on your local machine before touching Proxmox.
 **Step 12.1 — Write the `deploy-worker` workflow**
 > File: `.github/workflows/deploy-worker.yml`
 > Trigger: `repository_dispatch` with event type `scale-out`
-> The workflow must:
-> - Run on your self-hosted runner (label from Phase 3.5)
-> - Check out the repo
-> - Write the Proxmox secrets to env vars for Terraform
-> - Run `terraform init` then `terraform apply` incrementing `worker_count` by 1
-> - Capture the new worker's IP from `terraform output`
-> - Write that IP to a temporary inventory file
-> - Run Ansible `site.yml` targeting only the new worker
-> - Run `kubectl get nodes` and grep for the new node in `Ready` state
+> The workflow must perform these steps in order:
+>
+> **Pre-Terraform: Node Placement Selection**
+> - Read `terraform/node_capacities.json` using `jq` to get the max capacity per node
+> - For each Proxmox node in the map, call the Proxmox REST API: `GET /api2/json/nodes/{node}/qemu`
+>   - Authenticate using `PROXMOX_API_TOKEN_ID` and `PROXMOX_API_TOKEN_SECRET` secrets
+>   - Filter the response to count only VMs whose `name` field matches `worker-{node}-*`
+>   - Tool: curl + jq. Reference: https://pve.proxmox.com/pve-docs/api-viewer/#/nodes/{node}/qemu
+> - Calculate `remaining = max - current_count` for each node
+> - Select the node with the highest remaining; tiebreak on highest max
+> - If all nodes are at max: fail the step with `exit 1` and a clear message — do not proceed
+> - Derive the new worker name: query existing VMs on the selected node, find highest sequence, increment
+>
+> **Terraform Apply**
+> - `terraform init` with Terraform Cloud backend
+> - Read the current workers map from `terraform show -json`
+> - Add the new worker entry (name, selected node, default memory/cores) to the map
+> - `terraform apply` passing the updated workers map — Terraform creates one new VM on the selected node
+> - Capture the new VM's IP from `terraform output`
+>
+> **Ansible Join**
+> - Write the new VM's IP to a temporary inventory file
+> - Run Ansible `site.yml` targeting only the new worker (common → containerd → kubeadm → worker roles)
+>
+> **Verify**
+> - Poll `kubectl get nodes` until the new node appears in `Ready` state (timeout after 5 minutes)
+>
 > Docs for repository_dispatch trigger: https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows#repository_dispatch
 
 **Step 12.2 — Write the `remove-worker` workflow**
 > File: `.github/workflows/remove-worker.yml`
 > Trigger: `repository_dispatch` with event type `scale-in`
-> The `client_payload` will contain the node name from AlertManager.
+> The `client_payload` will contain the k8s node name from AlertManager.
 > The workflow must:
-> - Read `github.event.client_payload.node` to get the target node name
-> - Re-query the Prometheus HTTP API to confirm the node is still below 30% RAM (stale alert guard)
+> - Read `github.event.client_payload.node` to get the target k8s node name
+> - Re-query the Prometheus HTTP API to confirm the node is STILL below 30% RAM (stale alert guard)
+>   - If it has recovered, exit cleanly without making any changes
 >   - Prometheus HTTP API: https://prometheus.io/docs/prometheus/latest/querying/api/
-> - If still underutilised: `kubectl drain`, then `kubectl delete node`
-> - Run `terraform apply` decrementing `worker_count` and targeting the specific VM for destruction
+> - Parse the Proxmox node name from the k8s node name using the naming convention (e.g. `worker-pve2-01` → Proxmox node is `pve2`)
+> - `kubectl drain <node> --ignore-daemonsets --delete-emptydir-data`
+> - `kubectl delete node <node>`
+> - Read current workers map from `terraform show -json`, remove the entry for this worker
+> - `terraform apply` with the updated map — Terraform destroys only that VM on its Proxmox node
 > - Verify the node no longer appears in `kubectl get nodes`
 
 **Step 12.3 — Write the `resize-worker` workflow**
@@ -513,6 +589,8 @@ Once running, these are the dashboards and panels to watch:
 | Proxmox cloud-init | https://pve.proxmox.com/wiki/Cloud-Init_Support |
 | QEMU guest agent | https://pve.proxmox.com/wiki/Qemu-guest-agent |
 | bpg/proxmox provider | https://registry.terraform.io/providers/bpg/proxmox/latest/docs |
+| bpg/proxmox VM data source | https://registry.terraform.io/providers/bpg/proxmox/latest/docs/data-sources/virtual_environment_vms |
+| Proxmox list VMs per node API | https://pve.proxmox.com/pve-docs/api-viewer/#/nodes/{node}/qemu |
 | Terraform for_each | https://developer.hashicorp.com/terraform/language/meta-arguments/for_each |
 | Terraform Cloud workspaces | https://developer.hashicorp.com/terraform/cloud-docs/workspaces/creating |
 | GitHub self-hosted runners | https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners |
