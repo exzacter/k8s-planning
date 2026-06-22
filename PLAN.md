@@ -272,96 +272,147 @@ node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes
 
 ### AlertManager → GitHub Actions Webhook
 
-This is the bridge between monitoring and your GitHub Actions workflows.
+This is the bridge between monitoring and your GitHub Actions workflows. There are no manual triggers — every action is driven by Prometheus metrics.
 
-1. Define a Prometheus alert rule (e.g. `NodeMemoryHighUtilisation`) that fires when a worker node's RAM usage is above a threshold for >5 minutes
-2. AlertManager routes that alert to a `webhook_config` receiver
-3. The webhook URL points to a GitHub Actions `repository_dispatch` endpoint
-4. GitHub Actions receives the payload, inspects the node name and current VM RAM allocation, and decides: vertical or horizontal scale
+**Three alert rules to define:**
 
-**AlertManager webhook config example (yaml — not a GitHub Actions file):**
+| Alert Rule | Condition | Fires → |
+|---|---|---|
+| `NodeMemoryPressure` | Worker RAM usage > 75% for >5 min | `repository_dispatch` type `memory-pressure` |
+| `NodeMemoryLow` | Worker RAM usage < 30% for >15 min | `repository_dispatch` type `scale-in` |
+| `ClusterHighLoad` | All workers above 75% RAM simultaneously | `repository_dispatch` type `scale-out` (bypass resize, go straight horizontal) |
+
+**Key PromQL for each:**
+```promql
+# Memory pressure per node (>75%)
+(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 75
+
+# Memory underutilised per node (<30%) — candidate for removal
+(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 < 30
+
+# All workers simultaneously under pressure — skip vertical, go horizontal immediately
+count(
+  (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 75
+) == count(kube_node_info{role="worker"})
+```
+
+**AlertManager config structure (yaml):**
 ```yaml
+route:
+  receiver: 'default'
+  routes:
+    - match:
+        alertname: NodeMemoryPressure
+      receiver: 'memory-pressure-hook'
+    - match:
+        alertname: NodeMemoryLow
+      receiver: 'scale-in-hook'
+    - match:
+        alertname: ClusterHighLoad
+      receiver: 'scale-out-hook'
+
 receivers:
-  - name: 'scale-trigger'
+  - name: 'memory-pressure-hook'
     webhook_configs:
       - url: 'https://api.github.com/repos/<owner>/<repo>/dispatches'
         http_config:
           authorization:
             credentials: '<github-pat-or-app-token>'
         send_resolved: false
+        # body must include: {"event_type": "memory-pressure", "client_payload": {"node": "<nodename>"}}
+  - name: 'scale-in-hook'
+    webhook_configs:
+      - url: 'https://api.github.com/repos/<owner>/<repo>/dispatches'
+        http_config:
+          authorization:
+            credentials: '<github-pat-or-app-token>'
+        send_resolved: false
+        # body must include: {"event_type": "scale-in", "client_payload": {"node": "<nodename>"}}
+  - name: 'scale-out-hook'
+    webhook_configs:
+      - url: 'https://api.github.com/repos/<owner>/<repo>/dispatches'
+        http_config:
+          authorization:
+            credentials: '<github-pat-or-app-token>'
+        send_resolved: false
+        # body must include: {"event_type": "scale-out"}
 ```
+
+> AlertManager's `webhook_config` sends a fixed JSON body — it cannot natively template `client_payload`. You will need a small intermediary (e.g. a Kubernetes Job triggered by AlertManager, or a webhook adapter like `alertmanager-webhook-adapter`) to enrich the payload with the node name before forwarding to GitHub.
 
 **AlertManager docs:** https://prometheus.io/docs/alerting/latest/configuration/
 **GitHub repository_dispatch docs:** https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event
+**alertmanager-webhook-adapter:** https://github.com/prometheus-community/alertmanager-webhook-adapter
 
 ---
 
 ## Layer 6: The Three GitHub Actions Workflows
 
-You said you don't want me to build the files — this section describes what each workflow does at a logical level so you can build them.
+This section describes what each workflow does at a logical level so you can build them. **No manual triggers** — all workflows are driven exclusively by AlertManager `repository_dispatch` events.
 
 ### Workflow 1: Deploy Worker
 
-**Trigger:** Manual (`workflow_dispatch`) or `repository_dispatch` event type `scale-out`
+**Trigger:** `repository_dispatch` event type `scale-out` (fired by AlertManager `ClusterHighLoad` alert)
 
 **Steps:**
 1. Checkout repo
 2. Authenticate to Terraform state backend (see Layer 7)
-3. Run `terraform apply` with incremented `worker_count` var
+3. Query current `worker_count` from Terraform state
+4. Run `terraform apply` with `worker_count + 1`
    - Terraform creates a new Proxmox VM from template
    - Outputs the new VM's IP address
-4. Run Ansible `site.yml` targeting only the new VM
+5. Run Ansible `site.yml` targeting only the new VM
    - Configures OS, installs k8s, runs `kubeadm join`
-5. Verify node is `Ready` via `kubectl get nodes`
-6. (Optional) Push a commit to the GitOps repo to record the new node in state
-
-**Key inputs:** `worker_count` (new desired total), or derive it from current count + 1
+6. Verify node is `Ready` via `kubectl get nodes`
 
 ---
 
 ### Workflow 2: Remove Worker
 
-**Trigger:** Manual (`workflow_dispatch`) or `repository_dispatch` event type `scale-in`
+**Trigger:** `repository_dispatch` event type `scale-in` (fired by AlertManager `NodeMemoryLow` alert — node sustained below 30% RAM for >15 min)
 
 **Steps:**
 1. Checkout repo
-2. Select the worker node to remove (pass as input, or select least-loaded via Prometheus query)
-3. Run `kubectl drain <node> --ignore-daemonsets --delete-emptydir-data`
-   - Safely evicts all pods before removal
-4. Run `kubectl delete node <node>`
-5. Run `terraform apply` with decremented `worker_count`
-   - Terraform destroys the matching Proxmox VM
-6. Verify node no longer appears in `kubectl get nodes`
+2. Read node name from `client_payload.node` (passed by AlertManager webhook adapter)
+3. Confirm node is still underutilised — re-query Prometheus before acting (guard against stale alert)
+4. `kubectl drain <node> --ignore-daemonsets --delete-emptydir-data`
+5. `kubectl delete node <node>`
+6. Run `terraform apply` with `worker_count - 1`, targeting the specific VM by name
+7. Verify node no longer appears in `kubectl get nodes`
 
-**Important:** Always drain before destroy. Destroying the VM first will leave the node object in `NotReady` state and orphan any running pods.
+> **Always drain before destroy.** Destroying the VM first leaves a `NotReady` node object and orphans running pods.
+> **Always re-check Prometheus before acting.** AlertManager can fire on transient dips — a short re-query prevents removing a node that has recovered.
 
 ---
 
 ### Workflow 3: Resize Worker (Vertical Scale Decision Gate)
 
-**Trigger:** `repository_dispatch` event type `memory-pressure` (from AlertManager webhook)
+**Trigger:** `repository_dispatch` event type `memory-pressure` (fired by AlertManager `NodeMemoryPressure` alert — single node above 75% RAM for >5 min)
 
-**The decision logic (describe in your workflow):**
+**Decision logic:**
 ```
-Query Prometheus: What is the current RAM allocation (in GB) for the affected worker VM?
-  → Terraform state / Proxmox API
+Read node name from client_payload.node
 
-IF current_ram < 16 GB:
-    Run terraform apply with increased memory for that VM
-    (Proxmox supports hot-plug memory changes on QEMU VMs if configured)
-    OR: gracefully restart the VM with new RAM setting (brief downtime, drain first)
-ELSE (current_ram >= 16 GB):
-    Trigger the Deploy Worker workflow (scale-out event)
-    (We've hit the vertical cap — must go horizontal)
+Query Terraform state → what is the current memory allocation (GB) for this VM?
+
+IF current_allocated_ram < 16 GB:
+    → Vertical scale path: increase RAM for this specific VM
+
+ELSE (current_allocated_ram >= 16 GB — vertical cap hit):
+    → Re-fire scale-out: trigger Deploy Worker workflow
+      (all workers are already at max vertical size, must go horizontal)
 ```
 
-**Steps for vertical resize path:**
-1. Drain the target worker (or use hot-plug if Proxmox QEMU agent is configured)
-2. Run `terraform apply` targeting only that VM with new `memory` value
-3. Wait for node to return `Ready`
-4. Uncordon: `kubectl uncordon <node>`
+**Vertical scale path steps:**
+1. `kubectl cordon <node>` — stop new pods scheduling here
+2. `kubectl drain <node> --ignore-daemonsets --delete-emptydir-data`
+3. `terraform apply` — increase `memory` on that specific VM (e.g. 8 GB → 12 GB → 16 GB in steps)
+4. Wait for VM to come back up and node to return `Ready`
+5. `kubectl uncordon <node>`
 
-**Key Proxmox capability to know:** QEMU guest agent + memory ballooning allows some memory changes without full reboot — but this is Proxmox-specific configuration, not guaranteed. Plan for a cordon/drain/resize/reboot/rejoin cycle to be safe.
+**Proxmox note:** QEMU guest agent + memory ballooning can allow hot-add without reboot, but this requires the balloon driver to be installed in the VM and configured in Proxmox. Don't rely on it — always plan for the cordon/drain/resize/reboot/rejoin cycle as the safe path.
+
+**Scale step size:** Define a fixed increment (e.g. +4 GB per trigger). This prevents a single alert from jumping a node straight to 16 GB when a smaller bump would resolve the pressure.
 
 ---
 
@@ -527,14 +578,14 @@ This is the order to build things so each layer has its dependencies ready:
    └── Verify ArgoCD syncs monitoring and ingress
 
 10. GitHub Actions workflows
-    └── Store Proxmox API token, kubeconfig, TF Cloud token in GitHub Secrets
-    └── Test deploy-worker workflow manually
-    └── Test remove-worker workflow manually
-    └── Test resize-worker workflow manually (with a low RAM threshold to trigger it)
+    └── Store secrets: Proxmox API token, kubeconfig, TF Cloud token, GitHub PAT
+    └── Deploy webhook adapter (intermediary between AlertManager and GitHub)
 
 11. AlertManager → GitHub Actions bridge
-    └── Configure webhook receiver in AlertManager
-    └── Create test alert to verify repository_dispatch fires correctly
+    └── Configure alert rules: NodeMemoryPressure, NodeMemoryLow, ClusterHighLoad
+    └── Configure webhook_config receivers → webhook adapter → repository_dispatch
+    └── End-to-end test: run stress-ng on a worker node → confirm alert fires
+       → confirm repository_dispatch received → confirm correct workflow runs
 ```
 
 ---
