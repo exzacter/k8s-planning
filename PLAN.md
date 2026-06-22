@@ -51,13 +51,17 @@ Use `bpg/proxmox`. It supports:
 - Cloud-init user-data injection (sets hostname, SSH keys, network)
 - VM cloning from a template (fast provisioning — create a Debian/Ubuntu template once)
 
-### Proxmox VM Template (one-time setup)
-Before Terraform can clone VMs quickly you need a base template:
-1. Download an Ubuntu 24.04 cloud image onto Proxmox
-2. Create a VM, attach the cloud image as a disk, convert to template
-3. Terraform clones this template for every new worker
+### Proxmox VM Template (automated via Packer)
+Before Terraform can clone VMs you need a base template. This is handled by **Packer**, not manually.
+Packer's `proxmox-iso` builder:
+1. Downloads the Ubuntu 24.04 cloud image directly onto Proxmox
+2. Creates a VM, boots it, and runs a provisioner script (installs `qemu-guest-agent`, disables swap)
+3. Converts the VM to a Proxmox template automatically
 
-**Resource:** https://pve.proxmox.com/wiki/Cloud-Init_Support
+The Packer template lives in `packer/ubuntu-2404.pkr.hcl` in the repo and is run once from the developer machine before any Terraform is applied. If the template needs rebuilding (OS updates), re-run Packer.
+
+**Packer proxmox builder:** https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox
+**Proxmox cloud-init reference:** https://pve.proxmox.com/wiki/Cloud-Init_Support
 
 ### Terraform File Structure
 ```
@@ -292,13 +296,11 @@ Use **ArgoCD** as your primary GitOps operator. The UI gives you visual feedback
 
 ### Install Method
 Use the **kube-prometheus-stack** Helm chart — it bundles all of the above.
-
-```
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-helm install monitoring prometheus-community/kube-prometheus-stack -n monitoring
-```
+Deployed via an **ArgoCD `Application` manifest** committed to `k8s/monitoring/` — not a manual `helm install`. ArgoCD installs and manages the chart automatically once the bootstrap workflow runs.
+Grafana dashboards (Node Exporter Full, Kubernetes Overview) are provisioned automatically via a `ConfigMap` — no manual dashboard import needed.
 
 **Chart docs:** https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack
+**Grafana provisioning:** https://grafana.com/docs/grafana/latest/administration/provisioning/#dashboards
 
 ### Key Prometheus Metric for Scaling Decision
 ```promql
@@ -422,7 +424,7 @@ This section describes what each workflow does at a logical level so you can bui
 3. Confirm node is still underutilised — re-query Prometheus before acting (guard against stale alert)
 4. `kubectl drain <node> --ignore-daemonsets --delete-emptydir-data`
 5. `kubectl delete node <node>`
-6. Run `terraform apply` with `worker_count - 1`, targeting the specific VM by name
+6. Read the current workers map from Terraform state, remove the entry for this worker, run `terraform apply` — Terraform destroys only that VM on its Proxmox node
 7. Verify node no longer appears in `kubectl get nodes`
 
 > **Always drain before destroy.** Destroying the VM first leaves a `NotReady` node object and orphans running pods.
@@ -458,6 +460,39 @@ ELSE (current_allocated_ram >= 16 GB — vertical cap hit):
 **Proxmox note:** QEMU guest agent + memory ballooning can allow hot-add without reboot, but this requires the balloon driver to be installed in the VM and configured in Proxmox. Don't rely on it — always plan for the cordon/drain/resize/reboot/rejoin cycle as the safe path.
 
 **Scale step size:** Define a fixed increment (e.g. +4 GB per trigger). This prevents a single alert from jumping a node straight to 16 GB when a smaller bump would resolve the pressure.
+
+---
+
+## Layer 6b: Notifications and Approval Gates — Discord
+
+### One-Way Notifications (Discord Webhook)
+Every GitHub Actions workflow sends a Discord message via a `curl` POST to a webhook URL stored as `DISCORD_WEBHOOK_URL` in GitHub Secrets. No bot or application needed for this.
+
+| Event | Colour |
+|---|---|
+| Workflow started | Yellow |
+| Success | Green |
+| Failure (link to run) | Red |
+| All nodes at capacity — needs human action | Red + @here |
+| Scale-in blocked — last worker | Yellow |
+| Resize cap hit → triggering scale-out | Blue |
+
+**Discord webhook reference:** https://discord.com/developers/docs/resources/webhook#execute-webhook
+**Embed format (colour-coded messages):** https://discord.com/developers/docs/resources/message#embed-object
+
+### Two-Way Approval Gates
+
+For blocked conditions (all nodes at capacity, last-worker scale-in protection), automation pauses and waits for human decision.
+
+**Option A — GitHub Environments (recommended starting point):**
+A `manual-review` environment is configured in GitHub repo settings with required reviewers. When triggered, the workflow pauses and a Discord notification is sent with the direct GitHub approval URL. The reviewer clicks the link from Discord and approves/rejects on GitHub. Zero extra infrastructure.
+Reference: https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment
+
+**Option B — Discord Bot with Button Interactions (in-Discord yes/no):**
+A Discord Application + Bot deployed as a k8s Deployment inside the cluster. Blocked events send a message with Yes/No buttons directly in Discord. Button clicks are received by the bot's interactions endpoint (exposed publicly via Cloudflare Tunnel — no port forwarding needed), which forwards the decision to GitHub via `repository_dispatch`.
+- Discord Application setup: https://discord.com/developers/applications
+- Cloudflare Tunnel (public HTTPS without port forwarding): https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/
+- Discord Interactions reference: https://discord.com/developers/docs/interactions/overview
 
 ---
 
@@ -544,39 +579,46 @@ Install **ingress-nginx** or **Traefik** to expose services externally. On Proxm
 
 ```
 repo/
+├── packer/
+│   └── ubuntu-2404.pkr.hcl       ← Packer template (builds Proxmox VM template)
+│
 ├── terraform/
 │   ├── main.tf
 │   ├── variables.tf
 │   ├── outputs.tf
 │   ├── controlplane.tf
 │   ├── worker.tf
-│   └── versions.tf
+│   ├── versions.tf
+│   └── node_capacities.json      ← per-node max worker counts (placement config)
 │
 ├── ansible/
-│   ├── inventory/
-│   │   ├── hosts.ini
-│   │   └── group_vars/
+│   ├── inventory/                ← generated at runtime, gitignored
+│   ├── group_vars/
 │   ├── roles/
 │   │   ├── common/
 │   │   ├── containerd/
 │   │   ├── kubeadm/
 │   │   ├── controlplane/
 │   │   └── worker/
+│   ├── runner-setup.yml          ← one-time runner VM configuration
 │   └── site.yml
 │
-├── k8s/                          ← GitOps watched directory
+├── k8s/                          ← GitOps watched directory (ArgoCD syncs this)
 │   ├── namespaces/
-│   ├── monitoring/               ← kube-prometheus-stack HelmRelease
-│   ├── ingress/                  ← ingress-nginx / MetalLB
-│   └── apps/                     ← your workloads
+│   ├── monitoring/               ← kube-prometheus-stack + alert rules + webhook adapter
+│   ├── ingress/                  ← ingress-nginx + MetalLB
+│   └── apps/
 │
-├── argocd/                       ← ArgoCD Application definitions
+├── argocd/
+│   ├── root-app.yaml             ← App-of-Apps root (applied once in bootstrap)
 │   └── apps/
 │       ├── monitoring.yaml
 │       └── ingress.yaml
 │
 └── .github/
     └── workflows/
+        ├── bootstrap.yml         ← one-time cluster creation (workflow_dispatch)
+        ├── terraform-plan.yml    ← runs on PRs touching terraform/
         ├── deploy-worker.yml
         ├── remove-worker.yml
         └── resize-worker.yml
@@ -586,51 +628,53 @@ repo/
 
 ## Layer 10: Build Sequence (Order of Operations)
 
-This is the order to build things so each layer has its dependencies ready:
-
 ```
-1. Proxmox setup
-   └── Create VM template (Ubuntu cloud image)
-   └── Enable Proxmox API token for Terraform
+1. One-time Proxmox prep (manual)
+   └── Create Proxmox API user + token
+   └── Run Packer to build the Ubuntu VM template
 
-2. Terraform state backend
-   └── Set up Terraform Cloud workspace OR MinIO VM
+2. Terraform state backend (manual)
+   └── Create Terraform Cloud account, organisation, workspace
 
-3. Terraform — control plane VM
-   └── Apply once manually to create control plane VM
+3. Self-hosted runner (manual + Ansible)
+   └── Clone Proxmox template → runner VM
+   └── Register runner with GitHub repo
+   └── Run ansible/runner-setup.yml from developer machine to install all tools
 
-4. Ansible — control plane configuration
-   └── Run site.yml against control plane
-   └── Verify `kubectl get nodes` shows control plane Ready
+4. Write all files (no cluster exists yet)
+   └── Terraform files (variables, controlplane, worker, outputs, versions)
+   └── terraform/node_capacities.json
+   └── Ansible roles (common, containerd, kubeadm, controlplane, worker)
+   └── ArgoCD manifests (k8s/ingress/, k8s/monitoring/, argocd/)
+   └── All GitHub Actions workflows
 
-5. Terraform — first worker VM
-   └── Apply with worker_count=1
+5. Store GitHub Secrets (manual)
+   └── TF_API_TOKEN, PROXMOX_API_TOKEN_ID/SECRET, ANSIBLE_SSH_PRIVATE_KEY, DISCORD_WEBHOOK_URL, GH_DISPATCH_TOKEN
 
-6. Ansible — worker configuration
-   └── Run site.yml against worker
-   └── Verify worker joins cluster
+6. Discord setup (manual)
+   └── Create webhook URL → store as DISCORD_WEBHOOK_URL secret
+   └── (Optional) Create Discord Application + Bot for in-Discord approval buttons
 
-7. CNI installation
-   └── kubectl apply Calico manifests
+7. GitHub Environments (manual)
+   └── Create manual-review environment with required reviewer
 
-8. Monitoring stack
-   └── Helm install kube-prometheus-stack
-   └── Configure AlertManager webhook receiver
+8. Run bootstrap workflow (one manual trigger — creates everything)
+   └── Terraform creates control plane + first worker VMs
+   └── Ansible configures all nodes, inits cluster, joins workers
+   └── Calico CNI applied
+   └── ArgoCD installed via Helm
+   └── ArgoCD App-of-Apps applied → syncs MetalLB, ingress-nginx, monitoring automatically
+   └── kubeconfig written to GitHub Secrets automatically
+   └── Discord notification: "✅ Cluster bootstrapped"
 
-9. GitOps operator
-   └── ArgoCD install (Helm or manifests)
-   └── Create ArgoCD Application pointing to k8s/ directory
-   └── Verify ArgoCD syncs monitoring and ingress
+9. AlertManager bridge (commit to Git → ArgoCD deploys)
+   └── PrometheusRule alert definitions committed to k8s/monitoring/
+   └── Webhook adapter Deployment committed to k8s/monitoring/
+   └── AlertManager routing config committed
+   └── ArgoCD syncs all of the above automatically
 
-10. GitHub Actions workflows
-    └── Store secrets: Proxmox API token, kubeconfig, TF Cloud token, GitHub PAT
-    └── Deploy webhook adapter (intermediary between AlertManager and GitHub)
-
-11. AlertManager → GitHub Actions bridge
-    └── Configure alert rules: NodeMemoryPressure, NodeMemoryLow, ClusterHighLoad
-    └── Configure webhook_config receivers → webhook adapter → repository_dispatch
-    └── End-to-end test: run stress-ng on a worker node → confirm alert fires
-       → confirm repository_dispatch received → confirm correct workflow runs
+10. End-to-end test
+    └── stress-ng on workers → alerts fire → workflows trigger → Discord notifications → cluster scales
 ```
 
 ---
