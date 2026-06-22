@@ -66,19 +66,24 @@ The Packer template lives in `packer/ubuntu-2404.pkr.hcl` in the repo and is run
 ### Terraform File Structure
 ```
 terraform/
-├── main.tf           ← provider config, VM resources
-├── variables.tf      ← node count, CPU, RAM, disk size
-├── outputs.tf        ← IP addresses passed to Ansible
-├── worker.tf         ← worker node VM definition
-├── controlplane.tf   ← control plane VM definition (static, not auto-scaled)
-└── versions.tf       ← provider version pins
+├── main.tf              ← provider config
+├── variables.tf         ← CP specs, worker defaults, VIP address
+├── outputs.tf           ← CP IPs, VIP, worker IPs passed to Ansible
+├── controlplane.tf      ← 3 CP VM resources (for_each over pve1/pve2/pve3)
+├── worker.tf            ← worker VM resources (for_each over workers map)
+├── node_capacities.json ← pve1/pve2/pve3 worker capacity; pve4 workers-only
+└── versions.tf          ← provider version pins
 ```
 
 ### Key Terraform Resources to Define
 
-**Control plane VM** (static — deployed once, never auto-scaled):
-- `proxmox_virtual_environment_vm.controlplane`
-- Fixed CPU/RAM (e.g. 4 CPU, 8 GB RAM), always on a designated node
+**Control plane VMs** (static — three VMs for HA, never auto-scaled):
+- `proxmox_virtual_environment_vm.controlplane` as a `for_each` over a map of three entries: one per control plane node
+- One VM on each of **pve1, pve2, pve3** — pve4 is reserved exclusively for workers
+- Fixed CPU/RAM per VM (e.g. 2 CPU, 4 GB RAM each — smaller than a single fat CP since there are three)
+- A **keepalived VIP** (virtual IP, also a VM or static configuration on Proxmox) provides a single stable endpoint for the Kubernetes API server — kubeadm is initialised with `--control-plane-endpoint <VIP>:6443`
+- kubeadm initialises the first CP node (`controlplane-pve1`), then the other two join with `kubeadm join --control-plane` — this forms a stacked etcd HA cluster (etcd runs on each CP node)
+- 4 static IPs required: 3 CP VMs + 1 VIP
 
 **Worker VM** (dynamic):
 - `proxmox_virtual_environment_vm.worker` using `for_each` over a **map**, not `count`
@@ -134,8 +139,9 @@ After Terraform creates VMs, Ansible:
 1. Configures the OS (sets hostname, installs packages, disables swap)
 2. Installs container runtime (containerd)
 3. Installs kubeadm, kubelet, kubectl
-4. On control plane: runs `kubeadm init`, generates join token
-5. On workers: runs `kubeadm join` with the token from the control plane
+4. On the first control plane node (`controlplane-pve1`): runs `kubeadm init --control-plane-endpoint <VIP>:6443 --upload-certs`, captures the certificate key and join command
+5. On the second and third control plane nodes (`controlplane-pve2`, `controlplane-pve3`): runs `kubeadm join <VIP>:6443 --control-plane --certificate-key <key>`
+6. On workers: runs `kubeadm join <VIP>:6443` with the worker join token
 
 ### Dynamic Inventory
 Ansible needs to know the IP addresses of newly created VMs.
@@ -158,8 +164,10 @@ ansible/
 │   ├── common/            ← OS prep, swap off, kernel modules
 │   ├── containerd/        ← container runtime install
 │   ├── kubeadm/           ← kubeadm + kubelet install
-│   ├── controlplane/      ← kubeadm init, kubeconfig setup
-│   └── worker/            ← kubeadm join
+│   ├── keepalived/        ← VIP setup, runs on all three CP VMs before kubeadm
+│   ├── controlplane/      ← kubeadm init on primary CP (pve1), captures cert key + join cmd
+│   ├── controlplane-join/ ← kubeadm join --control-plane for secondary CPs (pve2, pve3)
+│   └── worker/            ← kubeadm join (worker token)
 └── site.yml               ← master playbook that calls all roles
 ```
 
@@ -313,27 +321,46 @@ node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes
 
 ### AlertManager → GitHub Actions Webhook
 
-This is the bridge between monitoring and your GitHub Actions workflows. There are no manual triggers — every action is driven by Prometheus metrics.
+This is the bridge between monitoring and your GitHub Actions workflows. There are no manual triggers — every action is driven by Prometheus metrics. Scaling alerts cover all stretchable resources: RAM, CPU, and disk I/O.
 
-**Three alert rules to define:**
+**Alert rules to define:**
 
 | Alert Rule | Condition | Fires → |
 |---|---|---|
-| `NodeMemoryPressure` | Worker RAM usage > 75% for >5 min | `repository_dispatch` type `memory-pressure` |
-| `NodeMemoryLow` | Worker RAM usage < 30% for >15 min | `repository_dispatch` type `scale-in` |
-| `ClusterHighLoad` | All workers above 75% RAM simultaneously | `repository_dispatch` type `scale-out` (bypass resize, go straight horizontal) |
+| `NodeMemoryPressure` | Single worker RAM > 75% for >5 min | `repository_dispatch` type `resource-pressure`, metric=`memory` |
+| `NodeCPUPressure` | Single worker CPU > 80% for >5 min | `repository_dispatch` type `resource-pressure`, metric=`cpu` |
+| `NodeDiskPressure` | Single worker root disk > 80% for >5 min | `repository_dispatch` type `resource-pressure`, metric=`disk` |
+| `NodeUnderutilised` | Single worker RAM < 30% **and** CPU < 20% for >15 min | `repository_dispatch` type `scale-in` |
+| `ClusterHighLoad` | All workers above 75% RAM **or** all workers above 80% CPU simultaneously | `repository_dispatch` type `scale-out` (bypass resize, go straight horizontal) |
+
+The `resource-pressure` event type replaces the former `memory-pressure` — the `metric` field in `client_payload` tells the resize-worker workflow what resource triggered and informs its vertical scale decision (e.g. adding CPU vs RAM). Scale-in now requires **both** RAM and CPU to be low — a node that is CPU-bound but RAM-idle must not be removed.
 
 **Key PromQL for each:**
 ```promql
-# Memory pressure per node (>75%)
+# RAM pressure per node (>75%)
 (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 75
 
-# Memory underutilised per node (<30%) — candidate for removal
-(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 < 30
+# CPU pressure per node (>80%) — 5-minute rate smooths spikes
+100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
 
-# All workers simultaneously under pressure — skip vertical, go horizontal immediately
+# Disk pressure per node root filesystem (>80%)
+(1 - node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 > 80
+
+# Node underutilised — both RAM and CPU below threshold
+(
+  (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 < 30
+) and (
+  100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) < 20
+)
+
+# All workers simultaneously under RAM pressure — skip vertical, go horizontal immediately
 count(
   (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 75
+) == count(kube_node_info{role="worker"})
+
+# All workers simultaneously under CPU pressure — same: go horizontal immediately
+count(
+  100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
 ) == count(kube_node_info{role="worker"})
 ```
 
@@ -342,44 +369,33 @@ count(
 route:
   receiver: 'default'
   routes:
+    - match_re:
+        alertname: 'Node(Memory|CPU|Disk)Pressure'
+      receiver: 'resource-pressure-hook'
     - match:
-        alertname: NodeMemoryPressure
-      receiver: 'memory-pressure-hook'
-    - match:
-        alertname: NodeMemoryLow
+        alertname: NodeUnderutilised
       receiver: 'scale-in-hook'
     - match:
         alertname: ClusterHighLoad
       receiver: 'scale-out-hook'
 
 receivers:
-  - name: 'memory-pressure-hook'
+  - name: 'resource-pressure-hook'
     webhook_configs:
-      - url: 'https://api.github.com/repos/<owner>/<repo>/dispatches'
-        http_config:
-          authorization:
-            credentials: '<github-pat-or-app-token>'
+      - url: 'http://alertmanager-webhook-adapter.monitoring.svc/webhook'
         send_resolved: false
-        # body must include: {"event_type": "memory-pressure", "client_payload": {"node": "<nodename>"}}
+        # adapter enriches payload with node label and metric name before forwarding to GitHub
   - name: 'scale-in-hook'
     webhook_configs:
-      - url: 'https://api.github.com/repos/<owner>/<repo>/dispatches'
-        http_config:
-          authorization:
-            credentials: '<github-pat-or-app-token>'
+      - url: 'http://alertmanager-webhook-adapter.monitoring.svc/webhook'
         send_resolved: false
-        # body must include: {"event_type": "scale-in", "client_payload": {"node": "<nodename>"}}
   - name: 'scale-out-hook'
     webhook_configs:
-      - url: 'https://api.github.com/repos/<owner>/<repo>/dispatches'
-        http_config:
-          authorization:
-            credentials: '<github-pat-or-app-token>'
+      - url: 'http://alertmanager-webhook-adapter.monitoring.svc/webhook'
         send_resolved: false
-        # body must include: {"event_type": "scale-out"}
 ```
 
-> AlertManager's `webhook_config` sends a fixed JSON body — it cannot natively template `client_payload`. You will need a small intermediary (e.g. a Kubernetes Job triggered by AlertManager, or a webhook adapter like `alertmanager-webhook-adapter`) to enrich the payload with the node name before forwarding to GitHub.
+> AlertManager's `webhook_config` cannot natively template `client_payload`. The `alertmanager-webhook-adapter` handles translation: it receives the AlertManager payload, extracts the node label and alertname, maps them to a GitHub `repository_dispatch` event, and forwards to the GitHub API.
 
 **AlertManager docs:** https://prometheus.io/docs/alerting/latest/configuration/
 **GitHub repository_dispatch docs:** https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event
@@ -416,7 +432,7 @@ This section describes what each workflow does at a logical level so you can bui
 
 ### Workflow 2: Remove Worker
 
-**Trigger:** `repository_dispatch` event type `scale-in` (fired by AlertManager `NodeMemoryLow` alert — node sustained below 30% RAM for >15 min)
+**Trigger:** `repository_dispatch` event type `scale-in` (fired by AlertManager `NodeUnderutilised` alert — node sustained below 30% RAM **and** below 20% CPU for >15 min)
 
 **Steps:**
 1. Checkout repo
@@ -434,20 +450,26 @@ This section describes what each workflow does at a logical level so you can bui
 
 ### Workflow 3: Resize Worker (Vertical Scale Decision Gate)
 
-**Trigger:** `repository_dispatch` event type `memory-pressure` (fired by AlertManager `NodeMemoryPressure` alert — single node above 75% RAM for >5 min)
+**Trigger:** `repository_dispatch` event type `resource-pressure` (fired by AlertManager `NodeMemoryPressure`, `NodeCPUPressure`, or `NodeDiskPressure` — single node above threshold for >5 min)
 
 **Decision logic:**
 ```
 Read node name from client_payload.node
+Read triggering metric from client_payload.metric (memory | cpu | disk)
 
-Query Terraform state → what is the current memory allocation (GB) for this VM?
+Query Terraform state → what are the current resource allocations for this VM?
 
-IF current_allocated_ram < 16 GB:
-    → Vertical scale path: increase RAM for this specific VM
+FOR metric = memory:
+    IF current_allocated_ram < 16 GB → vertical scale path (increase RAM)
+    ELSE (cap hit) → trigger Deploy Worker (scale-out)
 
-ELSE (current_allocated_ram >= 16 GB — vertical cap hit):
-    → Re-fire scale-out: trigger Deploy Worker workflow
-      (all workers are already at max vertical size, must go horizontal)
+FOR metric = cpu:
+    IF current_allocated_cores < 8 cores → vertical scale path (increase vCPUs)
+    ELSE (cap hit) → trigger Deploy Worker (scale-out)
+
+FOR metric = disk:
+    Disk cannot be hot-extended safely — trigger Deploy Worker (scale-out) immediately
+    (disk pressure means the workload needs a new node, not a resize)
 ```
 
 **Vertical scale path steps:**
@@ -465,8 +487,10 @@ ELSE (current_allocated_ram >= 16 GB — vertical cap hit):
 
 ## Layer 6b: Notifications and Approval Gates — Discord
 
-### One-Way Notifications (Discord Webhook)
-Every GitHub Actions workflow sends a Discord message via a `curl` POST to a webhook URL stored as `DISCORD_WEBHOOK_URL` in GitHub Secrets. No bot or application needed for this.
+Notifications use three independent paths so that Discord always reflects cluster state, regardless of whether GitHub Actions is involved.
+
+### Path A — GitHub Actions → Discord (workflow events)
+Every GitHub Actions workflow sends a Discord message via a `curl` POST to `DISCORD_WEBHOOK_URL` (stored in GitHub Secrets). This path fires for actions the workflows initiate.
 
 | Event | Colour |
 |---|---|
@@ -476,6 +500,41 @@ Every GitHub Actions workflow sends a Discord message via a `curl` POST to a web
 | All nodes at capacity — needs human action | Red + @here |
 | Scale-in blocked — last worker | Yellow |
 | Resize cap hit → triggering scale-out | Blue |
+
+### Path B — AlertManager → Discord (cluster health events)
+AlertManager sends some alerts **directly** to a Discord webhook — not via the GitHub API. This path fires for cluster-level events that have nothing to do with scaling workflows: a node goes `NotReady`, a pod enters CrashLoopBackOff, disk fills on the control plane.
+
+These notifications arrive in Discord even if the GitHub Actions runner is down or GitHub's API is degraded.
+
+Configuration: add a separate `discord_config` receiver in AlertManager alongside the `webhook_config` receivers. AlertManager has native Discord support via `discord_configs` in v0.25+:
+```yaml
+receivers:
+  - name: 'cluster-health-discord'
+    discord_configs:
+      - webhook_url: '<DISCORD_WEBHOOK_URL>'
+        title: '{{ .CommonAnnotations.summary }}'
+        message: '{{ .CommonAnnotations.description }}'
+```
+Route non-scaling alerts (NodeNotReady, PodCrashLooping, DiskFull) to this receiver.
+
+**AlertManager Discord receiver docs:** https://prometheus.io/docs/alerting/latest/configuration/#discord_config
+
+### Path C — ArgoCD Notifications Controller → Discord (GitOps events)
+The ArgoCD Notifications Controller runs inside the cluster and fires when an ArgoCD Application goes out-of-sync, fails to sync, or degrades in health. This catches situations like a broken k8s manifest being committed to Git — ArgoCD will attempt to sync and fail, and Discord will be notified immediately without any workflow being involved.
+
+Configured via a `ConfigMap` in the `argocd` namespace (committed to Git, managed by ArgoCD itself):
+```yaml
+# argocd-notifications-cm ConfigMap
+triggers:
+  - name: on-sync-failed
+    condition: app.status.operationState.phase in ['Error', 'Failed']
+    template: app-sync-failed
+templates:
+  - name: app-sync-failed
+    discord:
+      content: "ArgoCD sync failed: {{.app.metadata.name}}"
+```
+Reference: https://argo-cd.readthedocs.io/en/stable/operator-manual/notifications/
 
 **Discord webhook reference:** https://discord.com/developers/docs/resources/webhook#execute-webhook
 **Embed format (colour-coded messages):** https://discord.com/developers/docs/resources/message#embed-object

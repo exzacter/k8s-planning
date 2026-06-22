@@ -4,6 +4,8 @@ Independent analysis of the planned architecture — what I would change, what I
 
 This document does not replace PLAN.md or EXECUTION_PLAN.md. It sits alongside them as a "what if" reference.
 
+**Status of items:** Items marked **[INCORPORATED]** have been merged into PLAN.md and EXECUTION_PLAN.md. Items marked **[SUGGESTION]** remain optional decisions.
+
 ---
 
 ## Section 1: Architectural Changes
@@ -56,7 +58,7 @@ Keep the GitHub Actions workflows for the resize (vertical scaling) path — tha
 
 ---
 
-### 1.2 HA Control Plane (3 Nodes Instead of 1)
+### 1.2 HA Control Plane (3 Nodes Instead of 1) — [INCORPORATED]
 
 **What the current plan does:**
 Single control plane VM. If it goes down, `kubectl` stops working, new pods cannot be scheduled, the API server is unavailable, and your GitHub Actions workflows cannot communicate with the cluster.
@@ -159,7 +161,7 @@ The irony/elegance: the cluster that the runners manage also runs the runners. O
 
 ---
 
-### 1.5 Scale on CPU + RAM, Not RAM Alone
+### 1.5 Scale on CPU + RAM + Disk, Not RAM Alone — [INCORPORATED]
 
 **What the current plan does:**
 Scale based on RAM threshold (>75% pressure, <30% idle).
@@ -201,7 +203,7 @@ The scale-in condition now requires BOTH RAM and CPU to be low — avoiding remo
 
 ---
 
-### 1.6 Notification Architecture: Split Cluster Events from GitHub Actions Events
+### 1.6 Notification Architecture: Split Cluster Events from GitHub Actions Events — [INCORPORATED]
 
 **What the current plan does:**
 All Discord notifications are fired from within GitHub Actions workflow steps. This means: if GitHub Actions is down, if the runner is down, or if the workflow fails before reaching the notification step — you get no Discord message about what happened.

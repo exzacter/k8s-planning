@@ -88,10 +88,12 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > If the template ever needs to be rebuilt (e.g. OS updates), re-run Packer — it replaces the old template.
 
 **Step 1.5 — Plan and reserve IP ranges**
-> Decide on these three ranges and set them as DHCP exclusions in your router before writing any Terraform:
-> - Control plane VM: 1 static IP
-> - Worker VMs: a range (e.g. 10 IPs)
+> Decide on these ranges and set them as DHCP exclusions in your router before writing any Terraform:
+> - Control plane VMs: 3 static IPs (one each on pve1, pve2, pve3)
+> - Control plane VIP: 1 additional static IP (keepalived virtual IP — the single address kubeadm and kubectl use to reach the API server)
+> - Worker VMs: a range (e.g. 10 IPs — pve1/pve2/pve3/pve4 all draw from this range)
 > - MetalLB pool: a separate range (e.g. 20 IPs — these become the IPs Kubernetes LoadBalancer Services receive)
+> pve4 will only run worker VMs, never control plane VMs.
 > This is the only step in the plan with no automation — it requires knowing your LAN layout.
 
 **Step 1.6 — Verify Proxmox API access from your developer machine**
@@ -203,9 +205,12 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Reference: https://registry.terraform.io/providers/bpg/proxmox/latest/docs#argument-reference
 
 **Step 5.3 — Write `terraform/controlplane.tf`**
-> Single `proxmox_virtual_environment_vm` resource, always on a fixed node.
-> Cloud-init: hostname, SSH public key, static IP.
+> Three `proxmox_virtual_environment_vm` resources using `for_each` over a map of `{controlplane-pve1, controlplane-pve2, controlplane-pve3}`.
+> Each VM targets its respective Proxmox node (pve1, pve2, pve3). pve4 receives no control plane VMs.
+> Cloud-init per VM: hostname, SSH public key, static IP (from the three reserved CP IPs).
+> Also define a variable for the keepalived VIP address — this is passed into Ansible and used as the kubeadm `--control-plane-endpoint`.
 > Reference: https://registry.terraform.io/providers/bpg/proxmox/latest/docs/resources/virtual_environment_vm
+> kubeadm HA reference: https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/high-availability/
 
 **Step 5.4 — Write `terraform/worker.tf`**
 > `proxmox_virtual_environment_vm` resource using `for_each` over the workers map.
@@ -214,8 +219,8 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Reference: https://developer.hashicorp.com/terraform/language/meta-arguments/for_each
 
 **Step 5.5 — Write `terraform/outputs.tf`**
-> Output: control plane IP, map of worker names → IPs, map of worker names → Proxmox nodes.
-> The IPs feed into Ansible inventory generation; the node map feeds the remove-worker workflow.
+> Output: map of CP node names → IPs (all three), VIP address, map of worker names → IPs, map of worker names → Proxmox nodes.
+> The CP IPs and VIP feed into Ansible inventory generation; the worker node map feeds the remove-worker workflow.
 
 **Step 5.6 — Create a CI workflow for `terraform plan` on pull requests**
 > File: `.github/workflows/terraform-plan.yml`
@@ -246,12 +251,29 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Adds Kubernetes apt repo, installs `kubeadm`, `kubelet`, `kubectl` at pinned version, holds versions with `apt-mark hold`.
 > Reference: https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/
 
-**Step 6.5 — Write the `controlplane` role**
-> Runs `kubeadm init`, copies `admin.conf` to ubuntu home, saves the join command to a file for worker nodes to read.
-> Reference: https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/create-cluster-kubeadm/
+**Step 6.5 — Write the `keepalived` role**
+> Installs and configures keepalived on all three CP VMs to provide the VIP.
+> The primary CP node (pve1) holds the VIP by default; pve2 and pve3 take over if pve1 fails.
+> The VIP address comes from the Ansible variable set in group_vars/controlplane.yml.
+> Reference: https://keepalived.readthedocs.io/en/latest/configuration_synopsis.html
+> keepalived on Ubuntu: https://ubuntu.com/server/docs/network-configuration (keepalived section)
 
-**Step 6.6 — Write the `worker` role**
-> Reads the join command from the control plane (via Ansible fetch), runs `kubeadm join`.
+**Step 6.6 — Write the `controlplane` role (primary node only — pve1)**
+> Runs `kubeadm init --control-plane-endpoint <VIP>:6443 --upload-certs --pod-network-cidr=192.168.0.0/16`.
+> `--upload-certs` uploads the cluster CA to etcd so secondary CP nodes can retrieve them during join (avoids manual cert copying).
+> Copies `admin.conf` to the ubuntu home directory.
+> Saves the worker join command and the certificate key to files (Ansible will fetch these to use in subsequent steps).
+> Reference: https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/high-availability/
+
+**Step 6.7 — Write the `controlplane-join` role (secondary nodes — pve2, pve3)**
+> Fetches the certificate key and join command from the primary CP node (via Ansible fetch).
+> Runs `kubeadm join <VIP>:6443 --control-plane --certificate-key <key>` on pve2 and pve3 sequentially.
+> Verifies each node appears as a control plane member before joining the next.
+> Reference: https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/high-availability/#steps-for-the-rest-of-the-control-plane-nodes
+
+**Step 6.8 — Write the `worker` role**
+> Reads the worker join command (fetched from primary CP), runs `kubeadm join <VIP>:6443`.
+> Workers always join via the VIP — if any CP node is down, the VIP routes them to a healthy API server.
 > Reference: https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/create-cluster-kubeadm/#join-nodes
 
 ---
