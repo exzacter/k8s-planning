@@ -36,7 +36,7 @@ Everything else is automated.
 These tools are only needed on your developer machine for the one-time bootstrap. After the self-hosted runner exists, all subsequent operations run on it.
 
 **Step 0.1 — Install all developer machine tools**
-> Install the following on every machine you work from. Supports Ubuntu/Debian (apt) and macOS (Homebrew).
+> Install the following on every machine you work from. Install methods vary by distro — see the table below.
 > - `tofuenv` + OpenTofu — IaC, version-pinned per project. Docs: https://github.com/tofuutils/tofuenv
 > - `packer` — builds the Proxmox VM template. Docs: https://developer.hashicorp.com/packer/install
 > - `kubectl` — interacts with the cluster from your machine. Docs: https://kubernetes.io/docs/tasks/tools/
@@ -45,10 +45,32 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > - `velero` CLI — verifies backups in Phase 13. Docs: https://velero.io/docs/latest/basic-install/
 > - `mc` (MinIO client) — verifies MinIO bucket contents in Phase 13. Docs: https://min.io/docs/minio/linux/reference/minio-mc.html
 > - `bao` (OpenBao CLI) — initialises, unseals, and loads secrets into OpenBao. Docs: https://openbao.org/docs/install/
-> - `ansible` via pip (not distro packages — apt/yum versions lag). Docs: https://docs.ansible.com/ansible/latest/installation_guide/
+> - `ansible` — install via pip on all distros (distro-packaged versions lag behind). Docs: https://docs.ansible.com/ansible/latest/installation_guide/
 > - `ansible-galaxy` collections: `kubernetes.core`, `community.general`
 > - `jq` — parses Terraform and Proxmox JSON output in workflows
 > - `git`, `curl`, `gh` (GitHub CLI) — repo ops and GitHub API calls. gh: https://cli.github.com/
+>
+> **Install methods by distro:**
+>
+> | Tool | Ubuntu / Debian | Fedora / RHEL / Rocky | Arch / Manjaro | macOS |
+> |---|---|---|---|---|
+> | `tofuenv` | GitHub releases (manual) | GitHub releases (manual) | AUR: `tofuenv` | `brew install tofuenv` |
+> | `packer` | HashiCorp apt repo | HashiCorp dnf repo | AUR: `packer` | `brew install packer` |
+> | `kubectl` | Kubernetes apt repo (`pkgs.k8s.io`) | Kubernetes dnf repo (`pkgs.k8s.io`) | Official repo: `kubectl` | `brew install kubectl` |
+> | `helm` | Helm install script or apt repo | Helm install script or dnf | Official repo: `helm` | `brew install helm` |
+> | `argocd` CLI | GitHub releases binary | GitHub releases binary | AUR: `argocd-cli` | `brew install argocd` |
+> | `velero` CLI | GitHub releases binary | GitHub releases binary | AUR: `velero-bin` | `brew install velero` |
+> | `mc` | Binary download | Binary download | Official repo: `minio-client` | `brew install minio/stable/mc` |
+> | `bao` | `.deb` from GitHub releases | `.rpm` from GitHub releases | AUR: `openbao-bin` | Binary download |
+> | `ansible` | `pip install ansible` | `pip install ansible` | `pip install ansible` | `pip install ansible` |
+> | `jq` | `apt install jq` | `dnf install jq` | `pacman -S jq` | `brew install jq` |
+> | `git` | `apt install git` | `dnf install git` | `pacman -S git` | `brew install git` |
+> | `curl` | `apt install curl` | `dnf install curl` | `pacman -S curl` | built-in |
+> | `gh` | GitHub apt repo | GitHub dnf repo | `pacman -S github-cli` | `brew install gh` |
+>
+> Arch users: tools marked AUR can be installed with any AUR helper (e.g. `yay -S <package>`). Tools marked "Official repo" are available via `pacman -S` directly.
+> Fedora/RHEL users: HashiCorp maintains a dnf repo (`rpm.releases.hashicorp.com`) for packer and other tools. The Kubernetes project maintains a dnf repo at `pkgs.k8s.io` for kubectl.
+> All distros: prefer `pip install ansible` over the distro-packaged version — distro packages typically lag several minor releases behind.
 
 **Step 0.2 — Generate the Ansible SSH key pair**
 > `ssh-keygen -t ed25519 -f ~/.ssh/k8s_ansible` — or let install-tools.sh prompt for this.
@@ -72,11 +94,24 @@ These tools are only needed on your developer machine for the one-time bootstrap
 **Step 1.3 — Write a Packer template for the base VM image**
 > Packer automates the entire VM template creation process — no manual Proxmox UI clicks.
 > The Packer `proxmox-iso` or `proxmox-clone` builder:
-> - Downloads the Ubuntu 24.04 cloud image directly on Proxmox
+> - Downloads the chosen Linux cloud image directly on Proxmox
 > - Creates a VM, attaches the image, boots it
 > - Runs a provisioner shell script: installs `qemu-guest-agent`, enables it, disables swap, applies updates
 > - Converts the VM to a Proxmox template automatically
-> Store the Packer template in `packer/ubuntu-2404.pkr.hcl` in the repo.
+> Store the Packer template in `packer/` in the repo. Name it to match your chosen distro (e.g. `packer/ubuntu-2404.pkr.hcl`, `packer/debian-12.pkr.hcl`, `packer/fedora-40.pkr.hcl`).
+>
+> **Choosing a base distro for your VMs:**
+> The Packer template defines what OS all your k8s VMs (control plane and workers) run. Pick one and be consistent — your Ansible roles must match.
+>
+> | Distro | Notes |
+> |---|---|
+> | Ubuntu 24.04 LTS | Most blog/tutorial coverage for kubeadm; containerd from Docker's apt repo; Kubernetes apt repo at `pkgs.k8s.io` |
+> | Debian 12 | Very similar to Ubuntu; same apt repos work; slightly smaller base image |
+> | Fedora 40 / Rocky Linux 9 | dnf-based; HashiCorp and Kubernetes both maintain official dnf repos; `containerd` available from Docker's dnf repo |
+> | Arch Linux | Smallest footprint; `kubeadm`, `kubelet`, `kubectl`, `containerd` all in official repos (no extra repo setup needed); rolling release means versions advance without you pinning them |
+>
+> **Ansible roles must reflect your choice.** Sections 6.2–6.4 below show where to branch by OS family. Ubuntu/Debian are the most documented choice for homelab kubeadm setups but any of the above works.
+>
 > Packer proxmox builder docs: https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox
 > Packer proxmox-clone builder: https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox/latest/components/builder/clone
 
@@ -154,6 +189,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Run it once from your developer machine targeting the runner VM's IP.
 > The playbook installs: OpenTofu (pinned version via tofuenv), Ansible, kubectl, Helm, argocd CLI, velero CLI, bao CLI, git, curl, jq, Python3.
 > This is the same tool set as `scripts/install-tools.sh` — consider reusing that script as the playbook's shell task.
+> The runner VM's OS will be whatever distro your Packer template produced (Step 1.3). Write the runner setup playbook to use `ansible_os_family` or `ansible_pkg_mgr` facts to branch package install tasks accordingly — e.g. `apt` tasks under `when: ansible_os_family == "Debian"`, `dnf` tasks under `when: ansible_os_family == "RedHat"`, `pacman` tasks under `when: ansible_os_family == "Archlinux"`.
 > After this, the runner has everything it needs to execute any workflow.
 
 **Step 3.4 — Place the Ansible SSH private key on the runner**
@@ -304,23 +340,53 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > - `workers.yml` — worker-specific variables: any worker-only settings (e.g. kubelet resource reservations)
 
 **Step 6.2 — Write the `common` role**
-> Targets all nodes. Disables swap, loads `overlay` + `br_netfilter` kernel modules, sets required sysctl params, installs apt dependencies.
+> Targets all nodes. Disables swap, loads `overlay` + `br_netfilter` kernel modules, sets required sysctl params, installs OS dependencies.
+> Use Ansible's `package` module for packages that have the same name across distros (e.g. `curl`, `ca-certificates`). For distro-specific package names or repos, branch by `ansible_os_family`:
+> ```yaml
+> - name: Install prerequisites
+>   package:
+>     name: [curl, ca-certificates, gnupg]
+>     state: present
+>
+> - name: Install apt transport (Debian/Ubuntu only)
+>   apt:
+>     name: apt-transport-https
+>     state: present
+>   when: ansible_os_family == "Debian"
+> ```
 > Reference: https://kubernetes.io/docs/setup/production-environment/container-runtimes/
 
 **Step 6.3 — Write the `containerd` role**
-> Installs containerd from Docker's apt repo. Generates default config, sets `SystemdCgroup = true`. Restarts service.
-> Reference: https://docs.docker.com/engine/install/ubuntu/
+> Installs containerd, generates default config, sets `SystemdCgroup = true`, restarts the service. The install path differs by distro:
+>
+> | Distro family | Install method |
+> |---|---|
+> | Ubuntu / Debian | Docker's apt repo (`download.docker.com/linux/ubuntu` or `/debian`); package name `containerd.io`. Reference: https://docs.docker.com/engine/install/ubuntu/ |
+> | Fedora / RHEL / Rocky | Docker's dnf repo (`download.docker.com/linux/fedora` or `/rhel`); package name `containerd.io`. Reference: https://docs.docker.com/engine/install/fedora/ |
+> | Arch / Manjaro | Official repo — `pacman -S containerd`; no extra repo setup needed. |
+>
+> All distros: after install, run `containerd config default > /etc/containerd/config.toml`, then set `SystemdCgroup = true` in that file (the `sed` or `lineinfile` approach works on all distros since the config format is identical regardless of how containerd was installed).
+> Branch the install tasks by `ansible_os_family` — the config generation and service restart steps are distro-agnostic and can run unconditionally.
 
 **Step 6.4 — Write the `kubeadm` role**
-> Adds Kubernetes apt repo, installs `kubeadm`, `kubelet`, `kubectl` at pinned version, holds versions with `apt-mark hold`.
+> Installs `kubeadm`, `kubelet`, `kubectl` at a pinned version, then prevents automatic upgrades. How to do this depends on the distro:
+>
+> | Distro family | Repo setup | Version pin |
+> |---|---|---|
+> | Ubuntu / Debian | Kubernetes apt repo at `pkgs.k8s.io`; package names `kubeadm`, `kubelet`, `kubectl` | `apt-mark hold kubeadm kubelet kubectl` |
+> | Fedora / RHEL / Rocky | Kubernetes dnf repo at `pkgs.k8s.io`; package names `kubeadm`, `kubelet`, `kubectl` | `dnf versionlock add kubeadm kubelet kubectl` (requires `python3-dnf-plugin-versionlock`) |
+> | Arch / Manjaro | No extra repo needed — packages are in the official `extra` repo or AUR; package names `kubeadm`, `kubelet`, `kubectl` | Add to `/etc/pacman.conf`: `IgnorePkg = kubeadm kubelet kubectl` |
+>
+> All distros: enable and start the `kubelet` service after install. kubeadm will manage the kubelet configuration — the version pinning is the critical step to prevent automatic upgrades breaking the cluster.
 > Reference: https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/
+> Kubernetes package repos (apt + dnf): https://pkgs.k8s.io
 
 **Step 6.5 — Write the `keepalived` role**
 > Installs and configures keepalived on all three CP VMs to provide the VIP.
 > The primary CP node (pve1) holds the VIP by default; pve2 and pve3 take over if pve1 fails.
 > The VIP address comes from the Ansible variable set in group_vars/controlplane.yml.
+> The package name is `keepalived` on all major distros — install via the appropriate package manager. The `/etc/keepalived/keepalived.conf` config format is identical across distros.
 > Reference: https://keepalived.readthedocs.io/en/latest/configuration_synopsis.html
-> keepalived on Ubuntu: https://ubuntu.com/server/docs/network-configuration (keepalived section)
 
 **Step 6.6 — Write the `controlplane` role (primary node only — pve1)**
 > Runs `kubeadm init --control-plane-endpoint <VIP>:6443 --upload-certs --pod-network-cidr=192.168.0.0/16`.
@@ -844,7 +910,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 | GitHub repository_dispatch | https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event |
 | kubeadm install | https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/ |
 | kubeadm cluster creation | https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/create-cluster-kubeadm/ |
-| containerd install | https://docs.docker.com/engine/install/ubuntu/ |
+| containerd install | Ubuntu/Debian: https://docs.docker.com/engine/install/ubuntu/ — Fedora: https://docs.docker.com/engine/install/fedora/ — Arch: `pacman -S containerd` |
 | Calico CNI | https://docs.tigera.io/calico/latest/getting-started/kubernetes/self-managed-onprem/onpremises |
 | MetalLB L2 | https://metallb.universe.tf/configuration/#layer-2-configuration |
 | ingress-nginx | https://kubernetes.github.io/ingress-nginx/deploy/ |

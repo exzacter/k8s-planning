@@ -49,16 +49,22 @@ It does NOT configure the OS — that is Ansible's job.
 Use `bpg/proxmox`. It supports:
 - `proxmox_virtual_environment_vm` resource for full VM lifecycle
 - Cloud-init user-data injection (sets hostname, SSH keys, network)
-- VM cloning from a template (fast provisioning — create a Debian/Ubuntu template once)
+- VM cloning from a template (fast provisioning — create a Linux VM template once using Packer)
+
+**Choosing a base distro for your VMs:**
+Pick one distro and use it consistently for all cluster VMs. Your Ansible roles must match your choice.
+- **Ubuntu 24.04 / Debian 12** — apt-based; most tutorial coverage for kubeadm; Kubernetes and Docker maintain official apt repos
+- **Fedora 40 / Rocky Linux 9** — dnf-based; HashiCorp and Kubernetes maintain official dnf repos at `pkgs.k8s.io`
+- **Arch Linux** — `kubeadm`, `kubelet`, `kubectl`, `containerd` all in official repos with no extra repo setup; rolling release means manual version pinning via `IgnorePkg` in `/etc/pacman.conf`
 
 ### Proxmox VM Template (automated via Packer)
 Before Terraform can clone VMs you need a base template. This is handled by **Packer**, not manually.
 Packer's `proxmox-iso` builder:
-1. Downloads the Ubuntu 24.04 cloud image directly onto Proxmox
+1. Downloads your chosen Linux cloud image directly onto Proxmox
 2. Creates a VM, boots it, and runs a provisioner script (installs `qemu-guest-agent`, disables swap)
 3. Converts the VM to a Proxmox template automatically
 
-The Packer template lives in `packer/ubuntu-2404.pkr.hcl` in the repo and is run once from the developer machine before any Terraform is applied. If the template needs rebuilding (OS updates), re-run Packer.
+The Packer template lives in `packer/` in the repo, named to match your chosen distro (e.g. `packer/ubuntu-2404.pkr.hcl`, `packer/debian-12.pkr.hcl`, `packer/rocky-9.pkr.hcl`). Run it once from the developer machine before any Terraform is applied. If the template needs rebuilding (OS updates), re-run Packer.
 
 **Packer proxmox builder:** https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox
 **Proxmox cloud-init reference:** https://pve.proxmox.com/wiki/Cloud-Init_Support
@@ -166,8 +172,8 @@ Placing on the node with the most headroom distributes load evenly across Proxmo
 ### What Ansible does here
 After Terraform creates VMs, Ansible:
 1. Configures the OS (sets hostname, installs packages, disables swap)
-2. Installs container runtime (containerd)
-3. Installs kubeadm, kubelet, kubectl
+2. Installs container runtime (containerd — from Docker's repo on Debian/Ubuntu/Fedora, or from the official distro repo on Arch)
+3. Installs kubeadm, kubelet, kubectl (from the Kubernetes repo appropriate for the distro)
 4. On the first control plane node (`controlplane-pve1`): runs `kubeadm init --control-plane-endpoint <VIP>:6443 --upload-certs`, captures the certificate key and join command
 5. On the second and third control plane nodes (`controlplane-pve2`, `controlplane-pve3`): runs `kubeadm join <VIP>:6443 --control-plane --certificate-key <key>`
 6. On workers: runs `kubeadm join <VIP>:6443` with the worker join token
@@ -223,7 +229,7 @@ ansible/
 | Industry standard for self-managed clusters | No built-in ingress or LB (need to add separately) |
 
 **Set up:**
-1. Ansible installs `kubeadm`, `kubelet`, `kubectl` from Kubernetes apt repo
+1. Ansible installs `kubeadm`, `kubelet`, `kubectl` from the appropriate repo for your distro (Kubernetes apt repo at `pkgs.k8s.io` for Debian/Ubuntu; Kubernetes dnf repo at `pkgs.k8s.io` for Fedora/RHEL; official `extra` repo for Arch)
 2. Ansible configures keepalived on all 3 CP nodes (VIP floats between them)
 3. Ansible runs `kubeadm init --control-plane-endpoint <VIP>:6443 --upload-certs --pod-network-cidr=192.168.0.0/16` on the primary CP node (pve1)
 4. Ansible runs `kubeadm join <VIP>:6443 --control-plane --certificate-key <key>` on pve2 and pve3
@@ -768,7 +774,7 @@ Install **ingress-nginx** or **Traefik** to expose services externally. On Proxm
 ```
 repo/
 ├── packer/
-│   └── ubuntu-2404.pkr.hcl       ← Packer template (builds Proxmox VM template)
+│   └── <distro>.pkr.hcl          ← Packer template (builds Proxmox VM template — one file per distro choice, e.g. ubuntu-2404.pkr.hcl, debian-12.pkr.hcl, rocky-9.pkr.hcl)
 │
 ├── terraform/
 │   ├── main.tf
@@ -827,7 +833,7 @@ repo/
 ```
 1. One-time Proxmox prep (manual)
    └── Create Proxmox API user + token
-   └── Run Packer to build the Ubuntu VM template
+   └── Run Packer to build the VM template for your chosen distro
 
 2. Terraform state backend (manual)
    └── Create Terraform Cloud account, organisation, workspace
