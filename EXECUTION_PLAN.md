@@ -399,6 +399,114 @@ These tools are only needed on your developer machine for the one-time bootstrap
 
 ---
 
+## Phase 7d: OpenBao — Secrets Management
+
+> OpenBao is the open-source Vault fork (Linux Foundation, MPL-2.0). It runs as a standalone Proxmox VM outside the k8s cluster and stores all project secrets. External Secrets Operator (ESO), deployed by ArgoCD, syncs secrets from OpenBao into k8s Secrets inside the cluster.
+> This VM must be provisioned before the bootstrap workflow runs (same as MinIO).
+
+**Step 7d.1 — Provision the OpenBao VM on Proxmox**
+> Clone the Packer template to a new VM: 2 CPU, 2 GB RAM, 20 GB disk.
+> Assign a static IP outside the k8s IP ranges from Step 1.5 (e.g. `192.168.1.61`).
+> SSH in and install OpenBao:
+> ```
+> curl -fsSL https://apt.releases.opentofu.org/gpg | sudo gpg --dearmor -o /usr/share/keyrings/opentofu.gpg
+> # Use OpenBao release from https://openbao.org/docs/install/
+> ```
+> Reference: https://openbao.org/docs/install/
+
+**Step 7d.2 — Initialise and unseal OpenBao**
+> Run `bao operator init` — this outputs 5 unseal keys and a root token. Store all of them in a secure location (KeePassXC or similar) immediately — they cannot be recovered.
+> Run `bao operator unseal` three times with three different unseal keys to unseal.
+> OpenBao must be manually unsealed after every reboot — this is expected for a homelab.
+> Docs: https://openbao.org/docs/concepts/seal/
+
+**Step 7d.3 — Enable kv-v2 secrets engine and load project secrets**
+> ```
+> export BAO_ADDR=http://192.168.1.61:8200
+> export BAO_TOKEN=<root-token>
+> bao secrets enable -path=secret kv-v2
+> ```
+> Load all project secrets into OpenBao:
+> ```
+> bao kv put secret/proxmox api_token_id=<value> api_token_secret=<value>
+> bao kv put secret/github pat=<value>
+> bao kv put secret/discord webhook_url=<value>
+> bao kv put secret/minio access_key=<value> secret_key=<value>
+> ```
+> These replace the equivalent GitHub Secrets entries — GitHub Secrets only retains the credentials needed by workflows before the cluster exists (TF_API_TOKEN, PROXMOX_API_TOKEN_ID/SECRET, ANSIBLE_SSH_PRIVATE_KEY, OPENBAO_ADDR, OPENBAO_TOKEN).
+
+**Step 7d.4 — Enable Kubernetes auth method (configured after bootstrap)**
+> The k8s auth method lets pods authenticate to OpenBao using their ServiceAccount token — no static credentials needed inside the cluster.
+> This step is completed after the cluster exists (Phase 9). Add it as a follow-up in the bootstrap workflow or run manually post-bootstrap:
+> ```
+> bao auth enable kubernetes
+> bao write auth/kubernetes/config \
+>   kubernetes_host=https://<VIP>:6443 \
+>   kubernetes_ca_cert=@/etc/kubernetes/pki/ca.crt
+> ```
+> Then create a policy and role for ESO:
+> ```
+> bao policy write eso-reader - <<EOF
+> path "secret/data/*" { capabilities = ["read"] }
+> EOF
+> bao write auth/kubernetes/role/eso \
+>   bound_service_account_names=external-secrets \
+>   bound_service_account_namespaces=external-secrets \
+>   policies=eso-reader ttl=1h
+> ```
+> Docs: https://openbao.org/docs/auth/kubernetes/
+
+**Step 7d.5 — Write ESO manifests for ArgoCD**
+> File: `k8s/secrets/` — add to ArgoCD App-of-Apps.
+>
+> `k8s/secrets/clustersecretstore.yaml`:
+> ```yaml
+> apiVersion: external-secrets.io/v1beta1
+> kind: ClusterSecretStore
+> metadata:
+>   name: openbao-backend
+> spec:
+>   provider:
+>     vault:
+>       server: "http://192.168.1.61:8200"
+>       path: "secret"
+>       version: "v2"
+>       auth:
+>         kubernetes:
+>           mountPath: "kubernetes"
+>           role: "eso"
+> ```
+>
+> `k8s/secrets/discord-webhook.yaml` (example ExternalSecret):
+> ```yaml
+> apiVersion: external-secrets.io/v1beta1
+> kind: ExternalSecret
+> metadata:
+>   name: discord-webhook
+>   namespace: monitoring
+> spec:
+>   refreshInterval: 1h
+>   secretStoreRef:
+>     name: openbao-backend
+>     kind: ClusterSecretStore
+>   target:
+>     name: discord-webhook-secret
+>   data:
+>     - secretKey: url
+>       remoteRef:
+>         key: discord
+>         property: webhook_url
+> ```
+> Add equivalent ExternalSecrets for MinIO credentials (namespace: velero) and GitHub PAT (namespace: monitoring, for webhook adapter).
+> ESO Helm chart docs: https://external-secrets.io/latest/introduction/getting-started/
+
+**Step 7d.6 — Add ESO to ArgoCD App-of-Apps**
+> Add `k8s/secrets/` as an ArgoCD Application in `argocd/apps/secrets.yaml`.
+> ESO itself is installed via its Helm chart — add a HelmRelease in `k8s/secrets/eso-helmrelease.yaml` pointing to the `external-secrets` Helm repo.
+> ArgoCD will deploy ESO and all ExternalSecret resources when it first syncs after bootstrap.
+
+---
+
 ## Phase 8: Discord Integration
 
 > Discord notifications fire on every cluster event. Approval gates pause automated workflows for human review when needed.
@@ -589,17 +697,17 @@ These tools are only needed on your developer machine for the one-time bootstrap
 
 **Step 11.1 — Store all secrets in GitHub Actions**
 > GitHub repo → Settings → Secrets and variables → Actions.
+> Only the secrets GitHub Actions needs BEFORE the cluster exists go here. All others live in OpenBao and are synced into the cluster by ESO.
 > Required secrets:
 > - `TF_API_TOKEN` — Terraform Cloud API token
 > - `PROXMOX_API_TOKEN_ID` — Proxmox API token ID
 > - `PROXMOX_API_TOKEN_SECRET` — Proxmox API token secret
 > - `ANSIBLE_SSH_PRIVATE_KEY` — Ansible SSH private key
-> - `DISCORD_WEBHOOK_URL` — Discord channel webhook URL
-> - `GH_DISPATCH_TOKEN` — GitHub PAT with `workflow` scope (for webhook adapter + Discord bot)
-> - `MINIO_ACCESS_KEY` — MinIO access key created in Step 11.0 (used by Velero Helm values)
-> - `MINIO_SECRET_KEY` — MinIO secret key created in Step 11.0
+> - `GH_DISPATCH_TOKEN` — GitHub PAT with `workflow` scope (for webhook adapter + scaling workflows)
+> - `OPENBAO_ADDR` — OpenBao server address (e.g. `http://192.168.1.61:8200`)
+> - `OPENBAO_TOKEN` — OpenBao token for bootstrap workflow to read secrets during cluster init
 > Note: `KUBECONFIG_B64` is written automatically by the bootstrap workflow (Step 9.1 step 14).
-> The MinIO credentials are also written into a k8s Secret by the bootstrap workflow before ArgoCD syncs Velero — include this as an extra step in the bootstrap workflow (Step 9.1) between steps 11 and 12.
+> Discord webhook URL, MinIO credentials, and all other runtime secrets are loaded into OpenBao (Step 7d.3) and synced into k8s Secrets by ESO post-bootstrap.
 
 **Step 11.2 — Set Terraform Cloud workspace environment variables**
 > Proxmox credentials set as sensitive environment variables in Terraform Cloud workspace.

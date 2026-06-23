@@ -658,6 +658,60 @@ Terraform state is a JSON file that tracks what resources exist. It **must not l
 
 ---
 
+## Layer 7c: Secrets Management — OpenBao + External Secrets Operator
+
+### Why not GitHub Secrets alone
+Every secret in GitHub Secrets is scoped to the repo and grants full access to anyone who can access Settings. The Proxmox API token in GitHub Secrets can create and destroy VMs; the kubeconfig grants cluster-admin. There is no audit log, no rotation mechanism, and k8s Secrets in etcd are base64-encoded — not encrypted at rest by default.
+
+### OpenBao
+OpenBao is the open-source fork of HashiCorp Vault, created after Vault's BSL license change in August 2023. It is maintained under the Linux Foundation (same governance as OpenTofu), MPL-2.0 licensed, and API-compatible with Vault — same CLI, same k8s auth method, same AWS Secrets Manager conceptual parallel.
+
+OpenBao runs as a standalone VM on Proxmox (outside the k8s cluster — same as MinIO) so it survives cluster rebuilds.
+
+Key features used here:
+- **k8s auth method** — pods authenticate to OpenBao using their ServiceAccount token; no static credentials needed inside the cluster
+- **Static secrets engine** (`kv-v2`) — stores all project credentials (Proxmox token, GitHub PAT, Discord webhook, MinIO keys) with versioning
+- **Audit log** — every secret read is recorded
+
+### External Secrets Operator (ESO)
+ESO is a k8s operator that reads secrets from OpenBao and syncs them into standard k8s Secrets automatically. ArgoCD manages the ESO deployment and `ExternalSecret` CRD definitions.
+
+```
+OpenBao (Proxmox VM) ← ESO reads secrets → k8s Secrets ← pods mount as env vars
+```
+
+`ExternalSecret` CRD example:
+```yaml
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: discord-webhook
+  namespace: monitoring
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: openbao-backend
+    kind: ClusterSecretStore
+  target:
+    name: discord-webhook-secret
+  data:
+    - secretKey: url
+      remoteRef:
+        key: monitoring/discord
+        property: webhook_url
+```
+
+### AWS career parallel
+This pattern maps directly to AWS Secrets Manager + External Secrets Operator on EKS — one of the most commonly asked-about patterns in AWS SysEng interviews. The ESO `ClusterSecretStore` → `ExternalSecret` model is identical whether the backend is OpenBao or AWS Secrets Manager.
+
+### Note on unsealing
+OpenBao (like Vault) requires manual unsealing after a reboot. For a homelab this is acceptable — run `bao operator unseal` after any reboot. Auto-unseal via a cloud KMS is possible but out of scope here.
+
+**OpenBao docs:** https://openbao.org/docs/
+**External Secrets Operator:** https://external-secrets.io/
+
+---
+
 ## Layer 7b: Backup — Velero + etcd Snapshots
 
 The cluster has no recovery path without backup. Two complementary mechanisms cover different failure modes.
@@ -744,6 +798,7 @@ repo/
 │   ├── monitoring/               ← kube-prometheus-stack, Loki, pve-exporter, alert rules, webhook adapter
 │   ├── ingress/                  ← ingress-nginx + MetalLB
 │   ├── backup/                   ← Velero HelmRelease + etcd snapshot CronJob
+│   ├── secrets/                  ← ESO HelmRelease, ClusterSecretStore, ExternalSecret definitions
 │   └── apps/
 │
 ├── argocd/
@@ -751,7 +806,8 @@ repo/
 │   └── apps/
 │       ├── monitoring.yaml
 │       ├── ingress.yaml
-│       └── backup.yaml
+│       ├── backup.yaml
+│       └── secrets.yaml          ← ESO + ExternalSecrets managed by ArgoCD
 │
 ├── renovate.json                 ← Renovate Bot config (auto-PRs for dependency updates)
 │
@@ -776,6 +832,11 @@ repo/
 2. Terraform state backend (manual)
    └── Create Terraform Cloud account, organisation, workspace
 
+2b. OpenBao + MinIO VMs (manual — must exist before bootstrap)
+   └── Clone Proxmox template → OpenBao VM; install + initialise + unseal OpenBao
+   └── Load all project secrets into OpenBao kv-v2 engine
+   └── Clone Proxmox template → MinIO VM; install MinIO; create velero + tfstate buckets
+
 3. Self-hosted runner (manual + Ansible)
    └── Clone Proxmox template → runner VM
    └── Register runner with GitHub repo
@@ -785,13 +846,14 @@ repo/
    └── Terraform files (variables, controlplane, worker, outputs, versions)
    └── terraform/node_capacities.json
    └── Ansible roles (common, containerd, kubeadm, keepalived, controlplane, controlplane-join, worker)
-   └── ArgoCD manifests (k8s/ingress/, k8s/monitoring/ [incl. Loki + pve-exporter], k8s/backup/ [Velero], argocd/)
+   └── ArgoCD manifests (k8s/ingress/, k8s/monitoring/ [incl. Loki + pve-exporter], k8s/backup/ [Velero], k8s/secrets/ [ESO + ExternalSecrets], argocd/)
    └── All GitHub Actions workflows
    └── renovate.json in repo root
    └── Branch protection rules on main (require terraform-plan check + 1 approval)
 
-5. Store GitHub Secrets (manual)
-   └── TF_API_TOKEN, PROXMOX_API_TOKEN_ID/SECRET, ANSIBLE_SSH_PRIVATE_KEY, DISCORD_WEBHOOK_URL, GH_DISPATCH_TOKEN
+5. Store GitHub Secrets (manual — only what GitHub Actions itself needs pre-cluster)
+   └── TF_API_TOKEN, PROXMOX_API_TOKEN_ID/SECRET, ANSIBLE_SSH_PRIVATE_KEY, GH_DISPATCH_TOKEN, OPENBAO_ADDR, OPENBAO_TOKEN
+   └── All other secrets (Discord webhook, MinIO keys) live in OpenBao; ESO syncs them into k8s Secrets inside the cluster
 
 6. Discord setup (manual)
    └── Create webhook URL → store as DISCORD_WEBHOOK_URL secret
@@ -842,6 +904,8 @@ repo/
 | Terraform S3 backend | https://developer.hashicorp.com/terraform/language/backend/s3 |
 | MinIO quickstart | https://min.io/docs/minio/linux/index.html |
 | KEDA (alternative scaling) | https://keda.sh/docs/latest/scalers/prometheus/ |
+| OpenBao (Vault fork) | https://openbao.org/docs/ |
+| External Secrets Operator | https://external-secrets.io/latest/ |
 
 ---
 
