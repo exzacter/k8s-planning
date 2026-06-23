@@ -35,27 +35,28 @@ Everything else is automated.
 
 These tools are only needed on your developer machine for the one-time bootstrap. After the self-hosted runner exists, all subsequent operations run on it.
 
-**Step 0.1 — Install Terraform via tfenv**
-> Version manager for Terraform — pins exact version per project.
-> Docs: https://github.com/tfutils/tfenv
+**Step 0.1 — Run `scripts/install-tools.sh`**
+> The repo contains a setup script that installs every tool needed on a developer machine.
+> Supports Ubuntu/Debian (apt) and macOS (Homebrew).
+> Tools installed:
+> - `tofuenv` + OpenTofu — IaC (version-pinned via tofuenv; replaces tfenv/Terraform)
+> - `packer` — builds the Proxmox VM template
+> - `kubectl` — interacts with the cluster from your machine
+> - `helm` — used for any one-off chart operations
+> - `argocd` CLI — connects ArgoCD to the GitHub repo during bootstrap
+> - `velero` CLI — verifies backups in Phase 13
+> - `mc` (MinIO client) — verifies MinIO bucket contents in Phase 13
+> - `bao` (OpenBao CLI) — initialises, unseals, and loads secrets into OpenBao
+> - `ansible` + `pip` — configures nodes; installed via pip to avoid stale distro versions
+> - `ansible-galaxy` collections: `kubernetes.core`, `community.general`
+> - `jq` — parses Terraform and Proxmox JSON output in workflows
+> - `git`, `curl`, `gh` (GitHub CLI) — repo ops and GitHub API calls
+> Docs for version managers: tofuenv: https://github.com/tofuutils/tofuenv
 
-**Step 0.2 — Install Ansible via pip**
-> Use pip, not distro packages — apt/yum versions lag significantly.
-> Docs: https://docs.ansible.com/ansible/latest/installation_guide/intro_installation.html
-
-**Step 0.3 — Install Ansible Galaxy collections**
-> Install `kubernetes.core` and `community.general`.
-> Docs: https://docs.ansible.com/ansible/latest/collections_guide/collections_installing.html
-
-**Step 0.4 — Install kubectl, Helm, Packer, jq**
-> kubectl: https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/
-> Helm: https://helm.sh/docs/intro/install/
-> Packer: https://developer.hashicorp.com/packer/install
-> jq: https://jqlang.github.io/jq/download/
-
-**Step 0.5 — Generate the Ansible SSH key pair**
-> `ssh-keygen` using ed25519. The public key goes into every VM via cloud-init.
-> The private key gets stored as a GitHub Actions secret and placed on the runner.
+**Step 0.2 — Generate the Ansible SSH key pair**
+> `ssh-keygen -t ed25519 -f ~/.ssh/k8s_ansible` — or let install-tools.sh prompt for this.
+> The public key goes into every VM via cloud-init (Terraform `initialization` block).
+> The private key gets stored as `ANSIBLE_SSH_PRIVATE_KEY` in GitHub Actions Secrets.
 
 ---
 
@@ -154,7 +155,8 @@ These tools are only needed on your developer machine for the one-time bootstrap
 **Step 3.3 — Configure the runner VM with Ansible (from your developer machine)**
 > Rather than manually installing tools on the runner, write an Ansible playbook at `ansible/runner-setup.yml`.
 > Run it once from your developer machine targeting the runner VM's IP.
-> The playbook installs: Terraform (pinned version via tfenv), Ansible, kubectl, Helm, git, curl, jq, Python3.
+> The playbook installs: OpenTofu (pinned version via tofuenv), Ansible, kubectl, Helm, argocd CLI, velero CLI, bao CLI, git, curl, jq, Python3.
+> This is the same tool set as `scripts/install-tools.sh` — consider reusing that script as the playbook's shell task.
 > After this, the runner has everything it needs to execute any workflow.
 
 **Step 3.4 — Place the Ansible SSH private key on the runner**
