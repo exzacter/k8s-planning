@@ -88,13 +88,26 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > If the template ever needs to be rebuilt (e.g. OS updates), re-run Packer — it replaces the old template.
 
 **Step 1.5 — Plan and reserve IP ranges**
-> Decide on these ranges and set them as DHCP exclusions in your router before writing any Terraform:
-> - Control plane VMs: 3 static IPs (one each on pve1, pve2, pve3)
-> - Control plane VIP: 1 additional static IP (keepalived virtual IP — the single address kubeadm and kubectl use to reach the API server)
-> - Worker VMs: a range (e.g. 10 IPs — pve1/pve2/pve3/pve4 all draw from this range)
-> - MetalLB pool: a separate range (e.g. 20 IPs — these become the IPs Kubernetes LoadBalancer Services receive)
+> Decide on these ranges and set them as DHCP exclusions in your router before writing any Terraform.
+> Every IP listed here must be excluded from DHCP so no other device on the LAN can claim them.
+>
+> | Purpose | Count | Example range |
+> |---|---|---|
+> | Control plane VIP (keepalived) | 1 | 192.168.1.9 |
+> | Control plane VM — pve1 | 1 | 192.168.1.10 |
+> | Control plane VM — pve2 | 1 | 192.168.1.11 |
+> | Control plane VM — pve3 | 1 | 192.168.1.12 |
+> | Workers — pve1 (max 3) | 3 | 192.168.1.100–102 |
+> | Workers — pve2 (max 6) | 6 | 192.168.1.110–115 |
+> | Workers — pve3 (max 4) | 4 | 192.168.1.120–123 |
+> | Workers — pve4 (max 2) | 2 | 192.168.1.130–131 |
+> | Self-hosted runner VM | 1 | 192.168.1.50 |
+> | MetalLB pool (LoadBalancer Services) | 20 | 192.168.1.200–219 |
+>
+> The per-node worker ranges will be codified in `terraform/node_capacities.json` in Phase 5a.
+> CP IPs and VIP will be hardcoded as defaults in `terraform/variables.tf` in Phase 5b.
+> Adjust ranges to your actual LAN subnet — the above are illustrative only.
 > pve4 will only run worker VMs, never control plane VMs.
-> This is the only step in the plan with no automation — it requires knowing your LAN layout.
 
 **Step 1.6 — Verify Proxmox API access from your developer machine**
 > Use curl to call `GET /api2/json/nodes` with the API token from Step 1.2.
@@ -182,10 +195,20 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Example: a 64 GB node with other workloads might support 3 workers at 8 GB each.
 
 **Step 5a.2 — Create `terraform/node_capacities.json`**
-> Committed to Git — maps each Proxmox node name to its maximum worker count.
-> Example: `{ "pve1": 3, "pve2": 6, "pve3": 4, "pve4": 2 }`
-> Changing a node's capacity is a Git commit — fully auditable.
-> The deploy-worker workflow reads this file before calling Terraform to determine where to place the new VM.
+> Committed to Git. Maps each Proxmox node to its maximum worker count and its dedicated IP range for worker VMs.
+> Each node gets a non-overlapping range sized exactly to its max worker count.
+> Example:
+> ```json
+> {
+>   "pve1": { "max_workers": 3, "worker_ip_start": "192.168.1.100", "worker_ip_end": "192.168.1.102" },
+>   "pve2": { "max_workers": 6, "worker_ip_start": "192.168.1.110", "worker_ip_end": "192.168.1.115" },
+>   "pve3": { "max_workers": 4, "worker_ip_start": "192.168.1.120", "worker_ip_end": "192.168.1.123" },
+>   "pve4": { "max_workers": 2, "worker_ip_start": "192.168.1.130", "worker_ip_end": "192.168.1.131" }
+> }
+> ```
+> All IPs in these ranges must also be in the DHCP exclusion list you configured in Step 1.5 — otherwise your router may hand them to other devices.
+> Changing a node's capacity or IP range is a Git commit — fully auditable.
+> The deploy-worker workflow reads this file to determine placement AND to select the next available IP for the new VM.
 
 **Step 5a.3 — Document the worker naming convention**
 > Pattern: `worker-{proxmox-node}-{zero-padded-sequence}` (e.g. `worker-pve2-01`, `worker-pve1-03`)
@@ -195,9 +218,14 @@ These tools are only needed on your developer machine for the one-time bootstrap
 ### 5b: Terraform Resources
 
 **Step 5.1 — Write `terraform/variables.tf`**
-> Variables needed: Proxmox API URL, token ID (sensitive), token secret (sensitive), template name,
-> control plane node, control plane specs, SSH public key, network bridge name.
-> The workers variable is a **map of objects** (key = worker name, value = `{node, memory, cores, disk_size}`).
+> Variables needed: Proxmox API URL, token ID (sensitive), token secret (sensitive), template name, SSH public key, network bridge name, LAN gateway, LAN DNS server.
+>
+> Static IPs for control plane — defined as defaults in variables.tf, never change after first apply:
+> - `controlplane_ips` — map of CP node name → static IP (e.g. `{ "pve1": "192.168.1.10", "pve2": "192.168.1.11", "pve3": "192.168.1.12" }`)
+> - `controlplane_vip` — the keepalived virtual IP (e.g. `"192.168.1.9"`) — this is the address kubeadm and all workers use to reach the API server
+>
+> The workers variable is a **map of objects** — key = worker name, value = `{node, memory, cores, ip}`.
+> The `ip` field is populated by the deploy-worker workflow before calling Terraform — Terraform never picks IPs itself.
 > Never use a simple `worker_count` integer — the map is the interface.
 
 **Step 5.2 — Write `terraform/main.tf`**
@@ -214,13 +242,17 @@ These tools are only needed on your developer machine for the one-time bootstrap
 
 **Step 5.4 — Write `terraform/worker.tf`**
 > `proxmox_virtual_environment_vm` resource using `for_each` over the workers map.
-> `each.key` = VM name, `each.value.node` = target Proxmox node, `each.value.memory` = RAM.
+> `each.key` = VM name, `each.value.node` = target Proxmox node, `each.value.memory` = RAM, `each.value.ip` = static IP.
+> The cloud-init `initialization` block uses `each.value.ip` to set the static IP, gateway, and DNS on each VM at boot — no manual network config, no DHCP.
 > Using a map (not `count`) means modifying one worker never touches others.
 > Reference: https://developer.hashicorp.com/terraform/language/meta-arguments/for_each
+> bpg/proxmox cloud-init reference: https://registry.terraform.io/providers/bpg/proxmox/latest/docs/resources/virtual_environment_vm#initialization
 
 **Step 5.5 — Write `terraform/outputs.tf`**
 > Output: map of CP node names → IPs (all three), VIP address, map of worker names → IPs, map of worker names → Proxmox nodes.
-> The CP IPs and VIP feed into Ansible inventory generation; the worker node map feeds the remove-worker workflow.
+> Worker IPs in the output are the same values that were passed in via the workers map — Terraform is not discovering them, it is echoing back what the workflow gave it.
+> The CP IPs and VIP feed into Ansible inventory generation. The worker map feeds the remove-worker workflow so it knows which Proxmox node to destroy a given VM on.
+> The deploy-worker and remove-worker workflows both use `terraform show -json` to read current state rather than relying on output files, so state is always authoritative.
 
 **Step 5.6 — Create a CI workflow for `terraform plan` on pull requests**
 > File: `.github/workflows/terraform-plan.yml`

@@ -108,18 +108,47 @@ This naming convention serves three purposes:
 
 When your Proxmox environment spans multiple physical nodes (pve1, pve2, pve3...), each with different resource capacity, the deploy-worker workflow must decide WHERE to place a new VM before calling Terraform.
 
-**Node capacity config** — stored in `terraform/node_capacities.json` (tracked in Git):
-- A map of each Proxmox node name to its maximum allowed worker VMs
-- Example: `pve1=3, pve2=6, pve3=4, pve4=2`
-- These limits represent practical capacity (RAM headroom, CPU cores, storage), not hard Proxmox limits — you define them based on your hardware
+**Node capacity and IP config** — stored in `terraform/node_capacities.json` (tracked in Git):
 
-**Placement algorithm (runs in the deploy-worker workflow before Terraform):**
+```json
+{
+  "pve1": { "max_workers": 3, "worker_ip_start": "192.168.1.100", "worker_ip_end": "192.168.1.102" },
+  "pve2": { "max_workers": 6, "worker_ip_start": "192.168.1.110", "worker_ip_end": "192.168.1.115" },
+  "pve3": { "max_workers": 4, "worker_ip_start": "192.168.1.120", "worker_ip_end": "192.168.1.123" },
+  "pve4": { "max_workers": 2, "worker_ip_start": "192.168.1.130", "worker_ip_end": "192.168.1.131" }
+}
+```
+
+Each node gets its own non-overlapping IP range sized to its max worker count. The ranges sit inside the DHCP exclusion zone you configure in your router (Step 1.5) so nothing else on the LAN can claim them.
+
+Control plane static IPs and the keepalived VIP are defined separately in `terraform/variables.tf` as hardcoded defaults — they never change after initial setup.
+
+**IP selection (runs in the deploy-worker workflow, before Terraform):**
+1. Read `node_capacities.json` — get the `worker_ip_start` and `worker_ip_end` for the selected node
+2. Read the current workers map from Terraform state (`terraform show -json`) — collect all IPs already assigned to workers on that node
+3. Walk the IP range from `worker_ip_start` upward — take the first IP not already present in the workers map
+4. That IP becomes the `ip` field in the new workers map entry passed to `terraform apply`
+
+Terraform never picks IPs — it receives a complete entry and creates the VM with that exact IP injected via cloud-init. The workflow is the source of truth for IP assignment.
+
+**Resulting workers map in Terraform state (example):**
+```json
+{
+  "worker-pve2-01": { "node": "pve2", "memory": 4096, "cores": 2, "ip": "192.168.1.110" },
+  "worker-pve2-02": { "node": "pve2", "memory": 4096, "cores": 2, "ip": "192.168.1.111" },
+  "worker-pve1-01": { "node": "pve1", "memory": 4096, "cores": 2, "ip": "192.168.1.100" }
+}
+```
+
+When a worker is removed, its IP is freed — the next deploy on that node will reuse it (lowest available in range).
+
+**Placement algorithm (runs in the deploy-worker workflow, immediately before IP selection):**
 1. Read `node_capacities.json` from the repo
 2. Query the Proxmox API for each node: `GET /api2/json/nodes/{node}/qemu` — returns all VMs on that node
 3. Filter the response to count only VMs whose names match the worker naming pattern (`worker-{node}-*`)
-4. For each node: calculate `remaining = max_capacity - current_worker_count`
+4. For each node: calculate `remaining = max_workers - current_worker_count`
 5. Select the node with the **highest remaining capacity**
-6. Tiebreak rule: if two nodes have equal remaining capacity, prefer the one with the higher `max_capacity` value (it has more headroom overall)
+6. Tiebreak rule: if two nodes have equal remaining capacity, prefer the one with the higher `max_workers` value (it has more headroom overall)
 7. If ALL nodes are at their max: fail the workflow with a descriptive error — do not attempt to place the VM
 
 **Why highest remaining rather than first available:**
@@ -414,19 +443,32 @@ This section describes what each workflow does at a logical level so you can bui
 **Steps:**
 1. Checkout repo
 2. Authenticate to Terraform state backend
-3. **Run placement selection** (before any Terraform call):
+3. **Run placement selection:**
    - Read `terraform/node_capacities.json`
    - Query Proxmox API `GET /nodes/{node}/qemu` for each node
-   - Count worker VMs per node (filter by name pattern)
-   - Calculate remaining capacity per node
+   - Count worker VMs per node (filter by name pattern `worker-{node}-*`)
+   - Calculate `remaining = max_workers - current_count` per node
    - Select node with highest remaining; fail if all nodes are at max
-4. Derive the new worker name: `worker-{selected_node}-{next_sequence}`
-   - Next sequence = current highest sequence on that node + 1
-5. Run `terraform apply` passing the updated workers map (new entry added with selected node and default memory/cores)
-   - Terraform creates the VM on the selected Proxmox node
-   - Outputs the new VM's IP address
-6. Run Ansible `site.yml` targeting only the new VM
-7. Verify node is `Ready` via `kubectl get nodes`
+4. **Derive worker name:** `worker-{selected_node}-{next_sequence}`
+   - Next sequence = current highest sequence on that node + 1 (zero-padded, e.g. `01`, `02`)
+5. **Select IP for the new worker:**
+   - Read `worker_ip_start` and `worker_ip_end` for the selected node from `node_capacities.json`
+   - Run `terraform show -json` to get the current workers map from state
+   - Collect all IPs already assigned to workers on this node
+   - Walk the node's IP range from `worker_ip_start` upward — take the first IP not in use
+6. **Build the new workers map entry:**
+   ```json
+   { "node": "pve2", "memory": 4096, "cores": 2, "ip": "192.168.1.111" }
+   ```
+   Add it to the existing workers map under the new worker name
+7. Run `terraform apply` passing the complete updated workers map
+   - Terraform clones the template, injects the IP via cloud-init, starts the VM
+   - The VM boots and configures itself (hostname, SSH key, static IP) — no GUI, no interaction
+8. Generate a fresh kubeadm join token from the control plane VIP:
+   `kubeadm token create --print-join-command` — tokens expire after 24h so always generate fresh
+9. Run Ansible worker role targeting only the new VM's IP
+10. Verify node appears `Ready` via `kubectl get nodes`
+11. Send Discord notification (green — worker name, node, IP)
 
 ---
 
