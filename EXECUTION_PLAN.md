@@ -35,23 +35,20 @@ Everything else is automated.
 
 These tools are only needed on your developer machine for the one-time bootstrap. After the self-hosted runner exists, all subsequent operations run on it.
 
-**Step 0.1 — Run `scripts/install-tools.sh`**
-> The repo contains a setup script that installs every tool needed on a developer machine.
-> Supports Ubuntu/Debian (apt) and macOS (Homebrew).
-> Tools installed:
-> - `tofuenv` + OpenTofu — IaC (version-pinned via tofuenv; replaces tfenv/Terraform)
-> - `packer` — builds the Proxmox VM template
-> - `kubectl` — interacts with the cluster from your machine
-> - `helm` — used for any one-off chart operations
-> - `argocd` CLI — connects ArgoCD to the GitHub repo during bootstrap
-> - `velero` CLI — verifies backups in Phase 13
-> - `mc` (MinIO client) — verifies MinIO bucket contents in Phase 13
-> - `bao` (OpenBao CLI) — initialises, unseals, and loads secrets into OpenBao
-> - `ansible` + `pip` — configures nodes; installed via pip to avoid stale distro versions
+**Step 0.1 — Install all developer machine tools**
+> Install the following on every machine you work from. Supports Ubuntu/Debian (apt) and macOS (Homebrew).
+> - `tofuenv` + OpenTofu — IaC, version-pinned per project. Docs: https://github.com/tofuutils/tofuenv
+> - `packer` — builds the Proxmox VM template. Docs: https://developer.hashicorp.com/packer/install
+> - `kubectl` — interacts with the cluster from your machine. Docs: https://kubernetes.io/docs/tasks/tools/
+> - `helm` — used for any one-off chart operations. Docs: https://helm.sh/docs/intro/install/
+> - `argocd` CLI — connects ArgoCD to the GitHub repo during bootstrap. Docs: https://argo-cd.readthedocs.io/en/stable/cli_installation/
+> - `velero` CLI — verifies backups in Phase 13. Docs: https://velero.io/docs/latest/basic-install/
+> - `mc` (MinIO client) — verifies MinIO bucket contents in Phase 13. Docs: https://min.io/docs/minio/linux/reference/minio-mc.html
+> - `bao` (OpenBao CLI) — initialises, unseals, and loads secrets into OpenBao. Docs: https://openbao.org/docs/install/
+> - `ansible` via pip (not distro packages — apt/yum versions lag). Docs: https://docs.ansible.com/ansible/latest/installation_guide/
 > - `ansible-galaxy` collections: `kubernetes.core`, `community.general`
 > - `jq` — parses Terraform and Proxmox JSON output in workflows
-> - `git`, `curl`, `gh` (GitHub CLI) — repo ops and GitHub API calls
-> Docs for version managers: tofuenv: https://github.com/tofuutils/tofuenv
+> - `git`, `curl`, `gh` (GitHub CLI) — repo ops and GitHub API calls. gh: https://cli.github.com/
 
 **Step 0.2 — Generate the Ansible SSH key pair**
 > `ssh-keygen -t ed25519 -f ~/.ssh/k8s_ansible` — or let install-tools.sh prompt for this.
