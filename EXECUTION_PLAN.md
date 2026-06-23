@@ -288,6 +288,9 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > This is for visibility and review — it does not block the merge.
 > The comment lets you see exactly what Terraform will change before it runs.
 > Reference: https://developer.hashicorp.com/terraform/tutorials/automation/github-actions
+>
+> **After writing this workflow and pushing it, return to Step 4.5 and complete the branch protection setup:**
+> The `terraform-plan` status check name only appears in the GitHub branch protection UI after the workflow has run at least once on a PR. Open a test PR against `main` touching any file in `terraform/`, let the workflow run, then go to Settings → Branches → edit the `main` protection rule and add `terraform-plan` as a required status check.
 
 ---
 
@@ -295,8 +298,11 @@ These tools are only needed on your developer machine for the one-time bootstrap
 
 > Write all Ansible roles in this phase. Nothing is run yet — the bootstrap workflow executes them.
 
-**Step 6.1 — Write `ansible/group_vars/all.yml`**
-> Shared variables: Kubernetes version (e.g. `1.30`), pod CIDR (`192.168.0.0/16`), SSH user (`ubuntu`), SSH key path.
+**Step 6.1 — Write `ansible/group_vars/` variable files**
+> Three files, all committed to Git:
+> - `all.yml` — shared variables for every node: Kubernetes version (e.g. `1.30`), pod CIDR (`192.168.0.0/16`), SSH user (`ubuntu`), SSH key path, LAN gateway, DNS server
+> - `controlplane.yml` — control plane–specific variables: `keepalived_vip` (the VIP address from Step 1.5), `kubeadm_cert_key` (populated at runtime by bootstrap workflow), primary CP node name (`controlplane-pve1`)
+> - `workers.yml` — worker-specific variables: any worker-only settings (e.g. kubelet resource reservations)
 
 **Step 6.2 — Write the `common` role**
 > Targets all nodes. Disables swap, loads `overlay` + `br_netfilter` kernel modules, sets required sysctl params, installs apt dependencies.
@@ -501,18 +507,24 @@ These tools are only needed on your developer machine for the one-time bootstrap
 >
 > 1. Checkout repo
 > 2. Write Ansible SSH private key from secret to `~/.ssh/ansible_key`
-> 3. `terraform init` + `terraform apply` — creates control plane VM + first worker VM on the best-capacity node
-> 4. Generate Ansible inventory from `terraform output -json` using `jq`
-> 5. Run `ansible-playbook site.yml` (all roles) — configures OS, installs containerd/kubeadm, inits control plane, joins worker
-> 6. Apply Calico CNI manifests via kubectl
-> 7. Wait for all nodes `Ready`
-> 8. Install ArgoCD via `helm install` — this is the only manual Helm install; ArgoCD manages everything after this
-> 9. Wait for ArgoCD pods `Ready`
-> 10. Connect ArgoCD to the GitHub repo using `argocd repo add` (via argocd CLI or kubectl apply of a Repository secret)
-> 11. Apply the root App-of-Apps Application — ArgoCD picks up `argocd/apps/` and begins syncing MetalLB, ingress-nginx, monitoring
-> 12. Wait for all ArgoCD applications to reach `Synced/Healthy`
-> 13. Retrieve kubeconfig from control plane, base64-encode it, write it to GitHub Secrets via the GitHub API
-> 14. Send Discord notification: "✅ Cluster bootstrapped — {worker_count} workers ready, ArgoCD synced"
+> 3. `terraform init` + `terraform apply` — creates all 3 control plane VMs (pve1, pve2, pve3) + first worker VM on the best-capacity node (all with static IPs from cloud-init)
+> 4. Wait for VMs to finish cloud-init and become SSH-reachable (poll with ssh until ready)
+> 5. Generate Ansible inventory from `terraform output -json` using `jq` → writes `ansible/inventory/hosts.ini` with `[controlplane_primary]`, `[controlplane_secondary]`, and `[workers]` groups
+> 6. Run Ansible roles in order against the inventory:
+>    - `common` + `containerd` + `kubeadm` → all nodes
+>    - `keepalived` → all 3 CP nodes (VIP comes up before kubeadm runs)
+>    - `controlplane` → primary CP node (pve1) — `kubeadm init --control-plane-endpoint <VIP>:6443 --upload-certs --pod-network-cidr=192.168.0.0/16`
+>    - `controlplane-join` → secondary CP nodes (pve2, pve3) sequentially — `kubeadm join --control-plane`
+>    - `worker` → first worker node — `kubeadm join <VIP>:6443`
+> 7. Apply Calico CNI manifests via kubectl (pod CIDR must match `192.168.0.0/16`)
+> 8. Wait for all nodes `Ready` (`kubectl get nodes` — poll with timeout)
+> 9. Install ArgoCD via `helm install` — this is the only manual Helm install; ArgoCD manages everything after this
+> 10. Wait for ArgoCD pods `Ready`
+> 11. Connect ArgoCD to the GitHub repo (kubectl apply of an ArgoCD Repository Secret or `argocd repo add`)
+> 12. Apply the root App-of-Apps Application — ArgoCD picks up `argocd/apps/` and begins syncing MetalLB, ingress-nginx, monitoring (kube-prometheus-stack + Loki + pve-exporter), and backup (Velero)
+> 13. Wait for all ArgoCD applications to reach `Synced/Healthy`
+> 14. Retrieve kubeconfig from the primary CP node, base64-encode it, write it to GitHub Secrets via the GitHub API
+> 15. Send Discord notification: "✅ Cluster bootstrapped — {worker_count} workers ready, ArgoCD synced"
 >
 > ArgoCD CLI docs: https://argo-cd.readthedocs.io/en/stable/user-guide/commands/argocd/
 > ArgoCD repo secret: https://argo-cd.readthedocs.io/en/stable/operator-manual/declarative-setup/#repositories
@@ -523,32 +535,57 @@ These tools are only needed on your developer machine for the one-time bootstrap
 
 > These are all written as k8s manifests and deployed via ArgoCD from `k8s/monitoring/`.
 
-**Step 10.1 — Write the three PrometheusRule alert definitions**
-> `k8s/monitoring/alert-rules.yaml` — a `PrometheusRule` CRD with:
-> - `NodeMemoryPressure`: single worker RAM > 75% for 5 minutes
-> - `NodeMemoryLow`: single worker RAM < 30% for 15 minutes
-> - `ClusterHighLoad`: ALL workers simultaneously > 75% RAM
+**Step 10.1 — Write the five PrometheusRule alert definitions**
+> `k8s/monitoring/alert-rules.yaml` — a `PrometheusRule` CRD with five rules:
+> - `NodeMemoryPressure`: single worker RAM > 75% for 5 minutes → fires `resource-pressure` event (metric=`memory`)
+> - `NodeCPUPressure`: single worker CPU > 80% for 5 minutes → fires `resource-pressure` event (metric=`cpu`)
+> - `NodeDiskPressure`: single worker root disk > 80% for 5 minutes → fires `resource-pressure` event (metric=`disk`)
+> - `NodeUnderutilised`: single worker RAM < 30% **and** CPU < 20% for 15 minutes → fires `scale-in` event
+> - `ClusterHighLoad`: ALL workers simultaneously > 75% RAM **or** ALL workers > 80% CPU → fires `scale-out` event
+> The `NodeUnderutilised` rule uses a PromQL `and` expression to require both conditions — this prevents removing a node that is RAM-idle but CPU-bound.
 > Reference: https://prometheus-operator.dev/docs/user-guides/alerting/
 
 **Step 10.2 — Write and deploy the webhook adapter**
 > `k8s/monitoring/webhook-adapter.yaml` — a `Deployment` + `Service` in the `monitoring` namespace.
-> The adapter translates AlertManager's webhook payload into GitHub's `repository_dispatch` format, injecting the node label from the alert into `client_payload.node`.
+> The adapter translates AlertManager's webhook payload into GitHub's `repository_dispatch` format, injecting the node label from the alert into `client_payload.node` and the alert name into `client_payload.metric` (mapped: NodeMemoryPressure→memory, NodeCPUPressure→cpu, NodeDiskPressure→disk).
 > Store the GitHub PAT as a k8s Secret in the same namespace — the adapter reads it from there.
 > Reference: https://github.com/prometheus-community/alertmanager-webhook-adapter
 
 **Step 10.3 — Write AlertManager routing config**
 > Update the kube-prometheus-stack Helm values (or write an `AlertmanagerConfig` CRD) to route:
-> - `NodeMemoryPressure` → webhook adapter → `memory-pressure` dispatch
-> - `NodeMemoryLow` → webhook adapter → `scale-in` dispatch
+> - `NodeMemoryPressure`, `NodeCPUPressure`, `NodeDiskPressure` → webhook adapter → `resource-pressure` dispatch (with metric field set by adapter)
+> - `NodeUnderutilised` → webhook adapter → `scale-in` dispatch
 > - `ClusterHighLoad` → webhook adapter → `scale-out` dispatch
+> - `NodeNotReady`, `PodCrashLooping`, and other health alerts → AlertManager `discord_config` receiver directly (Path B notifications — bypasses GitHub entirely)
 > AlertmanagerConfig CRD: https://prometheus-operator.dev/docs/user-guides/alerting/#using-alertmanagerconfig
 
-**Step 10.4 — Commit all monitoring manifests**
+**Step 10.4 — Write ArgoCD Notifications Controller config**
+> The ArgoCD Notifications Controller is not enabled by default — it requires opt-in.
+> Enable it in the ArgoCD Helm values (or as an ArgoCD install argument): `--enable-notification-controller`.
+> Write `k8s/monitoring/argocd-notifications-cm.yaml` — a `ConfigMap` in the `argocd` namespace that configures:
+>   - A Discord contact point using `DISCORD_WEBHOOK_URL` from a Secret in the `argocd` namespace
+>   - Triggers for: `on-sync-failed`, `on-health-degraded`, `on-sync-succeeded`
+>   - Subscriptions on all ArgoCD Applications (or annotate individual Applications)
+> This implements Path C from PLAN.md Layer 6b — ArgoCD events → Discord independent of GitHub Actions.
+> Reference: https://argo-cd.readthedocs.io/en/stable/operator-manual/notifications/
+
+**Step 10.5 — Commit all monitoring manifests**
 > Committing to Git triggers ArgoCD to sync and apply them automatically — no manual kubectl needed.
 
 ---
 
 ## Phase 11: GitHub Actions Secrets
+
+**Step 11.0 — Deploy MinIO on Proxmox (prerequisite for Velero and optional TF state)**
+> MinIO must exist before the bootstrap workflow runs because Velero (deployed by ArgoCD in Phase 9 step 12) immediately tries to connect to it.
+> MinIO is not a Kubernetes workload — run it as a standalone VM on Proxmox (outside the k8s cluster) so it remains available during cluster rebuilds.
+> Steps:
+> 1. Clone the Packer template to create a small Proxmox VM (2 CPU, 4 GB RAM, 100 GB disk)
+> 2. Install MinIO: https://min.io/docs/minio/linux/index.html
+> 3. Create two buckets: `velero` (for Velero backups and etcd snapshots) and `tfstate` (for Terraform state if migrating from Terraform Cloud later)
+> 4. Create a MinIO access key and secret key with read/write access to the `velero` bucket
+> 5. Note the MinIO endpoint URL (e.g. `http://192.168.1.60:9000`) — this goes into the Velero Helm values
+> Assign this VM a static IP outside the k8s IP ranges from Step 1.5 (e.g. `192.168.1.60`).
 
 **Step 11.1 — Store all secrets in GitHub Actions**
 > GitHub repo → Settings → Secrets and variables → Actions.
@@ -559,7 +596,10 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > - `ANSIBLE_SSH_PRIVATE_KEY` — Ansible SSH private key
 > - `DISCORD_WEBHOOK_URL` — Discord channel webhook URL
 > - `GH_DISPATCH_TOKEN` — GitHub PAT with `workflow` scope (for webhook adapter + Discord bot)
-> Note: `KUBECONFIG_B64` is written automatically by the bootstrap workflow (Step 9.1 step 13).
+> - `MINIO_ACCESS_KEY` — MinIO access key created in Step 11.0 (used by Velero Helm values)
+> - `MINIO_SECRET_KEY` — MinIO secret key created in Step 11.0
+> Note: `KUBECONFIG_B64` is written automatically by the bootstrap workflow (Step 9.1 step 14).
+> The MinIO credentials are also written into a k8s Secret by the bootstrap workflow before ArgoCD syncs Velero — include this as an extra step in the bootstrap workflow (Step 9.1) between steps 11 and 12.
 
 **Step 11.2 — Set Terraform Cloud workspace environment variables**
 > Proxmox credentials set as sensitive environment variables in Terraform Cloud workspace.
@@ -592,7 +632,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Trigger: `repository_dispatch` type `scale-in`
 > Steps:
 > 1. Send Discord: "⏳ Scale-in triggered for {node}"
-> 2. Re-query Prometheus API — confirm still < 30% RAM; if recovered → send Discord "ℹ️ Scale-in cancelled — node recovered" → exit cleanly
+> 2. Re-query Prometheus API — confirm BOTH RAM < 30% AND CPU < 20% still hold (matching the `NodeUnderutilised` dual condition); if either has recovered → send Discord "ℹ️ Scale-in cancelled — node recovered" → exit cleanly
 > 3. Count current workers — if only 1 remains → send Discord "⚠️ Scale-in blocked — last worker" → enter `manual-review` gate
 > 4. `kubectl drain {node} --ignore-daemonsets --delete-emptydir-data`
 > 5. `kubectl delete node {node}`
@@ -603,13 +643,20 @@ These tools are only needed on your developer machine for the one-time bootstrap
 
 **Step 12.3 — Write `resize-worker` workflow**
 > File: `.github/workflows/resize-worker.yml`
-> Trigger: `repository_dispatch` type `memory-pressure`
+> Trigger: `repository_dispatch` type `resource-pressure` (carries `client_payload.metric`: `memory` | `cpu` | `disk`)
 > Steps:
-> 1. Send Discord: "⏳ Memory pressure on {node} — checking current allocation"
-> 2. Read current RAM for target VM from `terraform show -json`
-> 3. **Decision gate:**
->    - If current RAM < 16 GB: send Discord "⏳ Vertically scaling {name}: {old}GB → {new}GB"; cordon → drain → terraform apply (+4 GB) → wait for Ready → uncordon → send Discord "✅ Resize complete"
->    - If current RAM >= 16 GB: send Discord "ℹ️ {name} at cap (16 GB) — triggering horizontal scale-out"; fire `scale-out` repository_dispatch → exit
+> 1. Read `client_payload.node` and `client_payload.metric` from the dispatch payload
+> 2. Send Discord: "⏳ Resource pressure ({metric}) on {node} — checking current allocation"
+> 3. Read current RAM and CPU cores for target VM from `terraform show -json`
+> 4. **Decision gate by metric:**
+>    - **metric = memory:**
+>      - If current RAM < 16 GB: send Discord "⏳ Vertically scaling {name}: {old}GB RAM → {new}GB"; cordon → drain → terraform apply (+4 GB) → wait for Ready → uncordon → send Discord "✅ Memory resize complete"
+>      - If current RAM >= 16 GB: send Discord "ℹ️ {name} at RAM cap (16 GB) — triggering horizontal scale-out"; fire `scale-out` repository_dispatch → exit
+>    - **metric = cpu:**
+>      - If current cores < 8: send Discord "⏳ Vertically scaling {name}: {old} cores → {new} cores"; cordon → drain → terraform apply (+2 cores) → wait for Ready → uncordon → send Discord "✅ CPU resize complete"
+>      - If current cores >= 8: send Discord "ℹ️ {name} at CPU cap (8 cores) — triggering horizontal scale-out"; fire `scale-out` repository_dispatch → exit
+>    - **metric = disk:**
+>      - Disk pressure always triggers horizontal scale-out (VMs cannot be vertically resized for disk without unmounting); send Discord "ℹ️ Disk pressure on {name} — triggering horizontal scale-out"; fire `scale-out` repository_dispatch → exit
 > `terraform show` docs: https://developer.hashicorp.com/terraform/cli/commands/show
 
 ---
@@ -628,19 +675,20 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > - New node appears as `Ready` in `kubectl get nodes`
 > - Discord success notification appears
 
-**Step 13.2 — Test resize**
+**Step 13.2 — Test resize (memory)**
 > Run `stress-ng --vm 1 --vm-bytes 80%` on ONE worker.
-> Observe: `NodeMemoryPressure` alert → `resize-worker` workflow → cordon/drain/resize/rejoin → Discord notifications at each stage.
+> Observe: `NodeMemoryPressure` alert → `resize-worker` workflow (metric=memory) → cordon/drain/resize/rejoin → Discord notifications at each stage.
 > Verify the new RAM value in `terraform show`.
 
 **Step 13.3 — Test the 16 GB cap → horizontal trigger**
 > Manually update the workers map in Terraform to set one worker to 16 GB, apply.
-> Stress that worker. Confirm `resize-worker` detects the cap and triggers `deploy-worker` instead.
+> Stress that worker. Confirm `resize-worker` detects the RAM cap and triggers `deploy-worker` instead.
 > Discord should show both the "cap hit" notification and the subsequent scale-out notification.
+> Also test CPU cap: set a worker to 8 cores, run `stress-ng --cpu 8`, confirm same horizontal fallback.
 
 **Step 13.4 — Test scale-in**
-> Let workers idle. After 15 minutes, `NodeMemoryLow` fires.
-> Observe: `remove-worker` workflow → drain → destroy → Discord success notification.
+> Let workers idle. After 15 minutes, `NodeUnderutilised` fires (RAM < 30% AND CPU < 20%).
+> Observe: `remove-worker` workflow → dual metric re-check → drain → destroy → Discord success notification.
 > Confirm `terraform show` no longer lists the removed VM.
 
 **Step 13.5 — Test approval gate (capacity full)**
@@ -648,6 +696,26 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Stress the cluster to trigger `ClusterHighLoad`.
 > Confirm: Discord shows "🚨 @here at capacity" message with GitHub approval link → workflow pauses at `manual-review` gate → approve on GitHub (or via Discord bot if built) → workflow either proceeds or exits cleanly.
 > Reset `node_capacities.json` after testing.
+
+**Step 13.6 — Verify Loki receiving logs**
+> Open Grafana → Explore → select the Loki datasource.
+> Run the query: `{namespace="monitoring"}` — you should see log streams from Prometheus and AlertManager pods.
+> Run `{namespace="argocd"}` — confirm ArgoCD logs appear.
+> If no logs appear: check `kubectl get pods -n monitoring` to confirm Promtail DaemonSet pods are all Running on every node.
+> Loki datasource must appear in Grafana's datasource list (provisioned via the ConfigMap written in Step 7.6).
+
+**Step 13.7 — Verify Velero backup ran**
+> Run `velero backup get` — you should see a backup created within the last 24 hours with status `Completed`.
+> Run `velero backup describe <backup-name>` to confirm it backed up resources across all namespaces.
+> Confirm the MinIO `velero` bucket received the backup artifacts: `mc ls minio/velero/` from the MinIO VM.
+> Check the etcd CronJob: `kubectl get cronjob -n kube-system` should list `etcd-backup`; `kubectl get jobs -n kube-system` should show it ran successfully.
+> If Velero backup shows `Failed`: check MinIO credentials (Step 11.1 MINIO_ACCESS_KEY/MINIO_SECRET_KEY) are correctly injected into the Velero Helm values and the MinIO `velero` bucket exists.
+
+**Step 13.8 — Verify pve-exporter metrics in Grafana**
+> Open Grafana → Explore → select the Prometheus datasource.
+> Run the query: `pve_up` — you should see a metric per Proxmox node (pve1, pve2, pve3, pve4) all returning 1.
+> Open the Proxmox dashboard (imported in Step 7.8) — verify CPU, memory, and storage panels are populated.
+> If no `pve_` metrics appear: check `kubectl get servicemonitor -n monitoring` includes `pve-exporter`; check that the Prometheus scrape config is picking it up via `kubectl logs -n monitoring -l app=pve-exporter`.
 
 ---
 

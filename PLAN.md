@@ -176,9 +176,7 @@ After Terraform creates VMs, Ansible:
 Ansible needs to know the IP addresses of newly created VMs.
 Terraform outputs these IPs → write them to a file → Ansible reads it.
 
-Two patterns:
-- **Terraform output → `inventory.ini` file** (simpler): Terraform local-exec writes IPs to a file Ansible reads
-- **Terraform output → Ansible dynamic inventory plugin** (cleaner at scale): Use the `community.general.proxmox` inventory plugin
+The inventory is generated in the bootstrap workflow (and scaling workflows) using `terraform output -json | jq` to extract IP addresses and write a `hosts.ini` file on the runner before Ansible runs. The `inventory/` directory is gitignored — it only exists at runtime on the runner.
 
 ### Ansible Playbook Structure
 ```
@@ -226,9 +224,11 @@ ansible/
 
 **Set up:**
 1. Ansible installs `kubeadm`, `kubelet`, `kubectl` from Kubernetes apt repo
-2. Ansible runs `kubeadm init --pod-network-cidr=10.244.0.0/16` on control plane
-3. Ansible captures the join command and runs it on each worker
-4. Install CNI (Flannel or Calico) via kubectl apply
+2. Ansible configures keepalived on all 3 CP nodes (VIP floats between them)
+3. Ansible runs `kubeadm init --control-plane-endpoint <VIP>:6443 --upload-certs --pod-network-cidr=192.168.0.0/16` on the primary CP node (pve1)
+4. Ansible runs `kubeadm join <VIP>:6443 --control-plane --certificate-key <key>` on pve2 and pve3
+5. Ansible captures the worker join command and runs it on each worker node
+6. Install Calico CNI via `kubectl apply` (pod CIDR must be `192.168.0.0/16` to match the init flag)
 
 **kubeadm docs:** https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/
 
