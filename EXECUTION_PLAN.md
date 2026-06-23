@@ -172,7 +172,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 **Step 4.1 — Create the directory skeleton**
 > Create these directories with a `.gitkeep` so they appear in Git:
 > `packer/`, `terraform/`, `ansible/inventory/`, `ansible/roles/`, `ansible/group_vars/`,
-> `k8s/namespaces/`, `k8s/monitoring/`, `k8s/ingress/`, `k8s/apps/`,
+> `k8s/namespaces/`, `k8s/monitoring/`, `k8s/ingress/`, `k8s/backup/`, `k8s/apps/`,
 > `argocd/apps/`, `.github/workflows/`
 
 **Step 4.2 — Create `.gitignore`**
@@ -181,6 +181,33 @@ These tools are only needed on your developer machine for the one-time bootstrap
 **Step 4.3 — Create `terraform/versions.tf`**
 > Declare pinned Terraform version, `bpg/proxmox` provider version, and the Terraform Cloud backend block.
 > Provider version reference: https://registry.terraform.io/providers/bpg/proxmox/latest
+
+**Step 4.4 — Create `renovate.json` in the repo root**
+> Renovate Bot automatically opens PRs when new versions of Helm charts, Terraform providers, container images, or GitHub Actions are released.
+> The config file tells Renovate what to scan and how to group updates.
+> Minimal starting config:
+> ```json
+> {
+>   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+>   "extends": ["config:base"],
+>   "packageRules": [
+>     { "matchPackagePatterns": ["*"], "groupName": "all dependencies", "groupSlug": "all" }
+>   ]
+> }
+> ```
+> After committing this file, install the Renovate GitHub App at https://github.com/apps/renovate and grant it access to this repo.
+> Renovate will open an onboarding PR showing what it detected — review and merge it.
+> Reference: https://docs.renovatebot.com/configuration-options/
+
+**Step 4.5 — Configure branch protection rules on `main`**
+> In GitHub: Settings → Branches → Add branch protection rule for `main`.
+> Enable:
+> - Require a pull request before merging (1 approval minimum)
+> - Require status checks to pass before merging — add `terraform-plan` as a required check (write the workflow in Phase 5.6 first, then come back and add the check name)
+> - Require branches to be up to date before merging
+> - Do not allow force pushes
+> This ensures no infrastructure change can be merged without a passing Terraform plan and at least one review.
+> Reference: https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches
 
 ---
 
@@ -339,6 +366,30 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > A single `Application` manifest in `argocd/` that points to `argocd/apps/`.
 > ArgoCD discovers and syncs everything inside `argocd/apps/` automatically.
 > Reference: https://argo-cd.readthedocs.io/en/stable/operator-manual/cluster-bootstrapping/
+
+**Step 7.6 — Write Loki + Promtail manifests in `k8s/monitoring/`**
+> An ArgoCD `Application` pointing to the `grafana/loki-stack` Helm chart (bundles Loki + Promtail together).
+> Promtail deploys as a DaemonSet and automatically discovers and ships all container and system logs from every node to Loki.
+> In Grafana (already deployed via kube-prometheus-stack), add Loki as a datasource — this is done via a `ConfigMap` in the same way Grafana dashboards are provisioned, so no manual UI step.
+> With Loki added, Grafana's Explore view lets you search logs across all nodes in the same UI as your metrics.
+> Reference: https://grafana.com/docs/loki/latest/setup/install/helm/
+> Loki datasource provisioning: https://grafana.com/docs/grafana/latest/administration/provisioning/#data-sources
+
+**Step 7.7 — Write Velero manifest in `k8s/backup/`**
+> An ArgoCD `Application` pointing to the Velero Helm chart deployed to the `velero` namespace.
+> Helm values: set the object storage backend to MinIO (same MinIO used for Terraform state), configure credentials, enable the default backup storage location.
+> A `Schedule` CRD resource in the same directory triggers a daily full backup at 02:00 with 7-day retention.
+> A separate `CronJob` manifest on each control plane node runs `etcdctl snapshot save` nightly and uploads the snapshot to MinIO under an `etcd/` prefix.
+> No manual backup triggers — everything is GitOps-managed and runs automatically once ArgoCD syncs it.
+> Reference: https://velero.io/docs/latest/basic-install/
+> Velero Helm chart: https://vmware-tanzu.github.io/helm-charts/
+
+**Step 7.8 — Write prometheus-pve-exporter manifest in `k8s/monitoring/`**
+> A `Deployment` running the `prometheus-pve-exporter` container, pointed at the Proxmox API URL with the API token stored in a k8s Secret.
+> A `Service` and `ServiceMonitor` CRD so Prometheus (via kube-prometheus-stack) automatically discovers and scrapes the exporter.
+> This adds Proxmox-layer metrics to Grafana: per-Proxmox-node CPU/RAM, VM power states, storage pool utilisation.
+> Cross-referencing these with the placement algorithm in deploy-worker lets you see if a Proxmox host is saturated before committing to placing a VM there.
+> Reference: https://github.com/prometheus-pve/prometheus-pve-exporter
 
 ---
 
@@ -637,3 +688,11 @@ These tools are only needed on your developer machine for the one-time bootstrap
 | Discord interactions overview | https://discord.com/developers/docs/interactions/overview |
 | Discord signature verification | https://discord.com/developers/docs/interactions/overview#setting-up-an-endpoint-verifying-security-keys |
 | Cloudflare Tunnel | https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/ |
+| Loki Helm chart | https://grafana.com/docs/loki/latest/setup/install/helm/ |
+| Loki datasource provisioning | https://grafana.com/docs/grafana/latest/administration/provisioning/#data-sources |
+| Velero install | https://velero.io/docs/latest/basic-install/ |
+| Velero Helm chart | https://vmware-tanzu.github.io/helm-charts/ |
+| prometheus-pve-exporter | https://github.com/prometheus-pve/prometheus-pve-exporter |
+| Renovate Bot config | https://docs.renovatebot.com/configuration-options/ |
+| Renovate GitHub App | https://github.com/apps/renovate |
+| Branch protection rules | https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches |

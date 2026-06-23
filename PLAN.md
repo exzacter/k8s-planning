@@ -327,9 +327,12 @@ Use **ArgoCD** as your primary GitOps operator. The UI gives you visual feedback
 ### Stack
 - **Prometheus** — scrapes metrics from nodes and pods
 - **AlertManager** — receives Prometheus alerts, routes them to webhooks
-- **Grafana** — dashboards for cluster and node metrics
-- **node-exporter** — runs as a DaemonSet, exposes per-VM metrics (RAM, CPU, disk)
+- **Grafana** — dashboards, logs, and traces in one UI
+- **node-exporter** — DaemonSet exposing per-VM metrics (RAM, CPU, disk)
 - **kube-state-metrics** — exposes Kubernetes object state (pod count, node status)
+- **Loki** — log aggregation store; receives logs from Promtail
+- **Promtail** — DaemonSet log collector; ships container and system logs from every node to Loki
+- **prometheus-pve-exporter** — scrapes the Proxmox API and exposes hypervisor-level metrics (Proxmox node CPU/RAM, VM power state, storage pool free space) to Prometheus; gives visibility into the layer below Kubernetes
 
 ### Install Method
 Use the **kube-prometheus-stack** Helm chart — it bundles all of the above.
@@ -655,6 +658,36 @@ Terraform state is a JSON file that tracks what resources exist. It **must not l
 
 ---
 
+## Layer 7b: Backup — Velero + etcd Snapshots
+
+The cluster has no recovery path without backup. Two complementary mechanisms cover different failure modes.
+
+### Velero — Kubernetes Resource Backup
+
+Velero backs up all Kubernetes resources (Deployments, Services, ConfigMaps, Secrets, PVCs) as YAML to object storage. If the cluster is rebuilt from scratch, Velero can restore all workloads and their configuration.
+
+- Deployed via ArgoCD HelmRelease to the `velero` namespace (`k8s/backup/`)
+- Object storage backend: MinIO on Proxmox (same MinIO used for Terraform state — reuses existing infrastructure)
+- Schedule: daily full backup retained for 7 days
+- Restore is a single `velero restore create` command
+
+**What Velero covers:** k8s resources, PersistentVolume snapshots (for Prometheus data, Grafana data, Loki logs)
+**What Velero does not cover:** etcd state itself — that is a separate mechanism
+
+**Reference:** https://velero.io/docs/latest/
+
+### etcd Snapshots — Cluster State Backup
+
+etcd holds all cluster state. With a 3-node HA control plane, etcd survives individual node failures — but a simultaneous loss of all three or a data corruption event cannot be recovered without a snapshot. kubeadm exposes `etcdctl` on each control plane node.
+
+- A CronJob runs nightly on each control plane node: `etcdctl snapshot save /backup/etcd-$(date +%Y%m%d).db`
+- Snapshots are uploaded to MinIO (same bucket as Velero backups, different prefix)
+- Restore procedure: `etcdctl snapshot restore` followed by restarting the etcd static pod
+
+**Reference:** https://kubernetes.io/docs/tasks/administer-cluster/configure-upgrade-etcd/#backing-up-an-etcd-cluster
+
+---
+
 ## Layer 8: Networking Considerations
 
 ### CNI (Container Network Interface)
@@ -699,22 +732,28 @@ repo/
 │   │   ├── common/
 │   │   ├── containerd/
 │   │   ├── kubeadm/
-│   │   ├── controlplane/
+│   │   ├── keepalived/           ← VIP setup across all 3 CP nodes
+│   │   ├── controlplane/         ← kubeadm init (pve1 only)
+│   │   ├── controlplane-join/    ← kubeadm join --control-plane (pve2, pve3)
 │   │   └── worker/
 │   ├── runner-setup.yml          ← one-time runner VM configuration
 │   └── site.yml
 │
 ├── k8s/                          ← GitOps watched directory (ArgoCD syncs this)
 │   ├── namespaces/
-│   ├── monitoring/               ← kube-prometheus-stack + alert rules + webhook adapter
+│   ├── monitoring/               ← kube-prometheus-stack, Loki, pve-exporter, alert rules, webhook adapter
 │   ├── ingress/                  ← ingress-nginx + MetalLB
+│   ├── backup/                   ← Velero HelmRelease + etcd snapshot CronJob
 │   └── apps/
 │
 ├── argocd/
 │   ├── root-app.yaml             ← App-of-Apps root (applied once in bootstrap)
 │   └── apps/
 │       ├── monitoring.yaml
-│       └── ingress.yaml
+│       ├── ingress.yaml
+│       └── backup.yaml
+│
+├── renovate.json                 ← Renovate Bot config (auto-PRs for dependency updates)
 │
 └── .github/
     └── workflows/
@@ -745,9 +784,11 @@ repo/
 4. Write all files (no cluster exists yet)
    └── Terraform files (variables, controlplane, worker, outputs, versions)
    └── terraform/node_capacities.json
-   └── Ansible roles (common, containerd, kubeadm, controlplane, worker)
-   └── ArgoCD manifests (k8s/ingress/, k8s/monitoring/, argocd/)
+   └── Ansible roles (common, containerd, kubeadm, keepalived, controlplane, controlplane-join, worker)
+   └── ArgoCD manifests (k8s/ingress/, k8s/monitoring/ [incl. Loki + pve-exporter], k8s/backup/ [Velero], argocd/)
    └── All GitHub Actions workflows
+   └── renovate.json in repo root
+   └── Branch protection rules on main (require terraform-plan check + 1 approval)
 
 5. Store GitHub Secrets (manual)
    └── TF_API_TOKEN, PROXMOX_API_TOKEN_ID/SECRET, ANSIBLE_SSH_PRIVATE_KEY, DISCORD_WEBHOOK_URL, GH_DISPATCH_TOKEN
