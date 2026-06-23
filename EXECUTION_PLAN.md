@@ -54,22 +54,23 @@ These tools are only needed on your developer machine for the one-time bootstrap
 >
 > | Tool | Ubuntu / Debian | Fedora / RHEL / Rocky | Arch / Manjaro | macOS |
 > |---|---|---|---|---|
-> | `tofuenv` | GitHub releases (manual) | GitHub releases (manual) | AUR: `tofuenv` | `brew install tofuenv` |
-> | `packer` | HashiCorp apt repo | HashiCorp dnf repo | AUR: `packer` | `brew install packer` |
-> | `kubectl` | Kubernetes apt repo (`pkgs.k8s.io`) | Kubernetes dnf repo (`pkgs.k8s.io`) | Official repo: `kubectl` | `brew install kubectl` |
-> | `helm` | Helm install script or apt repo | Helm install script or dnf | Official repo: `helm` | `brew install helm` |
-> | `argocd` CLI | GitHub releases binary | GitHub releases binary | AUR: `argocd-cli` | `brew install argocd` |
-> | `velero` CLI | GitHub releases binary | GitHub releases binary | AUR: `velero-bin` | `brew install velero` |
-> | `mc` | Binary download | Binary download | Official repo: `minio-client` | `brew install minio/stable/mc` |
-> | `bao` | `.deb` from GitHub releases | `.rpm` from GitHub releases | AUR: `openbao-bin` | Binary download |
+> | `tofuenv` | GitHub releases (manual) or `brew install tofuenv` | GitHub releases (manual) or `brew install tofuenv` | `yay -S tofuenv` or `brew install tofuenv` | `brew install tofuenv` |
+> | `packer` | HashiCorp apt repo or `brew install packer` | HashiCorp dnf repo or `brew install packer` | `yay -S packer` or `brew install packer` | `brew install packer` |
+> | `kubectl` | Kubernetes apt repo (`pkgs.k8s.io`) or `brew install kubectl` | Kubernetes dnf repo (`pkgs.k8s.io`) or `brew install kubectl` | `pacman -S kubectl` or `brew install kubectl` | `brew install kubectl` |
+> | `helm` | Helm install script or apt repo or `brew install helm` | Helm install script or dnf or `brew install helm` | `pacman -S helm` or `brew install helm` | `brew install helm` |
+> | `argocd` CLI | GitHub releases binary or `brew install argocd` | GitHub releases binary or `brew install argocd` | `yay -S argocd-cli` or `brew install argocd` | `brew install argocd` |
+> | `velero` CLI | GitHub releases binary or `brew install velero` | GitHub releases binary or `brew install velero` | `yay -S velero-bin` or `brew install velero` | `brew install velero` |
+> | `mc` | Binary download or `brew install minio/stable/mc` | Binary download or `brew install minio/stable/mc` | `pacman -S minio-client` or `brew install minio/stable/mc` | `brew install minio/stable/mc` |
+> | `bao` | `.deb` from GitHub releases or `brew install openbao` | `.rpm` from GitHub releases or `brew install openbao` | `yay -S openbao-bin` or `brew install openbao` | `brew install openbao` |
 > | `ansible` | `pip install ansible` | `pip install ansible` | `pip install ansible` | `pip install ansible` |
-> | `jq` | `apt install jq` | `dnf install jq` | `pacman -S jq` | `brew install jq` |
-> | `git` | `apt install git` | `dnf install git` | `pacman -S git` | `brew install git` |
+> | `jq` | `apt install jq` or `brew install jq` | `dnf install jq` or `brew install jq` | `pacman -S jq` or `brew install jq` | `brew install jq` |
+> | `git` | `apt install git` or `brew install git` | `dnf install git` or `brew install git` | `pacman -S git` or `brew install git` | `brew install git` |
 > | `curl` | `apt install curl` | `dnf install curl` | `pacman -S curl` | built-in |
-> | `gh` | GitHub apt repo | GitHub dnf repo | `pacman -S github-cli` | `brew install gh` |
+> | `gh` | GitHub apt repo or `brew install gh` | GitHub dnf repo or `brew install gh` | `pacman -S github-cli` or `brew install gh` | `brew install gh` |
 >
-> Arch users: tools marked AUR can be installed with any AUR helper (e.g. `yay -S <package>`). Tools marked "Official repo" are available via `pacman -S` directly.
-> Fedora/RHEL users: HashiCorp maintains a dnf repo (`rpm.releases.hashicorp.com`) for packer and other tools. The Kubernetes project maintains a dnf repo at `pkgs.k8s.io` for kubectl.
+> All Linux distros: `brew install` (Homebrew for Linux) works as an alternative for most tools — install it once via `curl` if not present. The script will warn before installing brew. The table lists the native package manager first; where brew is also shown, either works.
+> Arch users additionally have `yay -S` (or any AUR helper) for packages not in the official repos.
+> Fedora/RHEL users: HashiCorp maintains a dnf repo (`rpm.releases.hashicorp.com`) for packer; the Kubernetes project maintains `pkgs.k8s.io` for kubectl.
 > All distros: prefer `pip install ansible` over the distro-packaged version — distro packages typically lag several minor releases behind.
 
 **Step 0.2 — Generate the Ansible SSH key pair**
