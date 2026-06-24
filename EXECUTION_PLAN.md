@@ -55,7 +55,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > | Tool | Ubuntu / Debian | Fedora / RHEL / Rocky | Arch / Manjaro | macOS |
 > |---|---|---|---|---|
 > | `tofuenv` | GitHub releases (manual) or `brew install tofuenv` | GitHub releases (manual) or `brew install tofuenv` | `yay -S tofuenv` or `brew install tofuenv` | `brew install tofuenv` |
-> | `packer` | HashiCorp apt repo or `brew install packer` | HashiCorp dnf repo or `brew install packer` | `yay -S packer` or `brew install packer` | `brew install packer` |
+> | `packer` | HashiCorp apt repo or `brew tap hashicorp/tap && brew install hashicorp/tap/packer` | HashiCorp dnf repo or `brew tap hashicorp/tap && brew install hashicorp/tap/packer` | `yay -S packer` or `brew tap hashicorp/tap && brew install hashicorp/tap/packer` | `brew tap hashicorp/tap && brew install hashicorp/tap/packer` |
 > | `kubectl` | Kubernetes apt repo (`pkgs.k8s.io`) or `brew install kubectl` | Kubernetes dnf repo (`pkgs.k8s.io`) or `brew install kubectl` | `pacman -S kubectl` or `brew install kubectl` | `brew install kubectl` |
 > | `helm` | Helm install script or apt repo or `brew install helm` | Helm install script or dnf or `brew install helm` | `pacman -S helm` or `brew install helm` | `brew install helm` |
 > | `argocd` CLI | GitHub releases binary or `brew install argocd` | GitHub releases binary or `brew install argocd` | `yay -S argocd-cli` or `brew install argocd` | `brew install argocd` |
