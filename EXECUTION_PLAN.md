@@ -87,12 +87,26 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > VM.Allocate, VM.Clone, VM.Config.*, Datastore.AllocateSpace, SDN.Use.
 > Docs: https://pve.proxmox.com/wiki/User_Management
 
-**Step 1.2 — Create a Proxmox API token for that user**
+**Step 1.2 — Create a Proxmox API token for terraform@pve**
 > Proxmox UI → Datacenter → Permissions → API Tokens → Add.
 > Store the Token ID and Secret immediately — the secret is only shown once.
 > Docs: https://pve.proxmox.com/wiki/Proxmox_VE_API#API_Tokens
 
-**Step 1.3 — Write a Packer template for the base VM image**
+**Step 1.3 — Create a dedicated Proxmox user and API token for Packer**
+> Do not reuse `terraform@pve` — Packer needs a different permission set.
+> Create `packer@pve` with these roles:
+> VM.Allocate, VM.Config.*, VM.Monitor, VM.PowerMgmt, VM.Audit, Datastore.AllocateSpace, Datastore.Audit, Sys.Modify.
+> `Sys.Modify` is required for Packer to upload ISOs to Proxmox storage.
+> `VM.Monitor` and `VM.PowerMgmt` are required to control the VM during the build — Terraform does not need these.
+> Packer does NOT need VM.Clone or SDN.Use — it builds from ISO, not from an existing template.
+>
+> Then create an API token for `packer@pve` (same UI path as Step 1.2). Store the Token ID and Secret immediately.
+> Export as environment variables before running `packer build`:
+> `PROXMOX_TOKEN_ID`, `PROXMOX_TOKEN_SECRET` — reference these in the Packer HCL via `var.proxmox_token_id` etc.
+> Also store both as GitHub Actions secrets (`PACKER_TOKEN_ID`, `PACKER_TOKEN_SECRET`) for any future CI builds.
+> Docs: https://pve.proxmox.com/wiki/User_Management
+
+**Step 1.4 — Write a Packer template for the base VM image**
 > Packer automates the entire VM template creation process — no manual Proxmox UI clicks.
 > The Packer `proxmox-iso` or `proxmox-clone` builder:
 > - Downloads the chosen Linux cloud image directly on Proxmox
@@ -116,12 +130,13 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Packer proxmox builder docs: https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox
 > Packer proxmox-clone builder: https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox/latest/components/builder/clone
 
-**Step 1.4 — Run Packer to build the template (one-time, from developer machine)**
-> `packer build packer/ubuntu-2404.pkr.hcl` — Packer authenticates to Proxmox API and builds the template.
+**Step 1.5 — Run Packer to build the template (one-time, from developer machine)**
+> Set `PROXMOX_TOKEN_ID` and `PROXMOX_TOKEN_SECRET` env vars from the `packer@pve` token created in Step 1.3, then run:
+> `packer build packer/ubuntu-2404.pkr.hcl`
 > After this, the template exists on Proxmox and Terraform can clone it for every VM.
 > If the template ever needs to be rebuilt (e.g. OS updates), re-run Packer — it replaces the old template.
 
-**Step 1.5 — Plan and reserve IP ranges**
+**Step 1.6 — Plan and reserve IP ranges**
 > Decide on these ranges and set them as DHCP exclusions in your router before writing any Terraform.
 > Every IP listed here must be excluded from DHCP so no other device on the LAN can claim them.
 >
@@ -143,8 +158,8 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Adjust ranges to your actual LAN subnet — the above are illustrative only.
 > pve4 will only run worker VMs, never control plane VMs.
 
-**Step 1.6 — Verify Proxmox API access from your developer machine**
-> Use curl to call `GET /api2/json/nodes` with the API token from Step 1.2.
+**Step 1.7 — Verify Proxmox API access from your developer machine**
+> Use curl to call `GET /api2/json/nodes` with the `terraform@pve` API token from Step 1.2.
 > A successful JSON response confirms auth before any Terraform is written.
 > API reference: https://pve.proxmox.com/pve-docs/api-viewer/
 
