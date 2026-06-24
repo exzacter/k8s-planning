@@ -95,9 +95,9 @@ These tools are only needed on your developer machine for the one-time bootstrap
 **Step 1.3 — Create a dedicated Proxmox user and API token for Packer**
 > Do not reuse `terraform@pve` — Packer needs a different permission set.
 > Create `packer@pve` with these roles:
-> VM.Allocate, VM.Config.*, VM.Monitor, VM.PowerMgmt, VM.Audit, Datastore.AllocateSpace, Datastore.Audit, Sys.Modify.
+> VM.Allocate, VM.Config.*, VM.PowerMgmt, VM.Audit, Datastore.AllocateSpace, Datastore.Audit, Sys.Modify.
 > `Sys.Modify` is required for Packer to upload ISOs to Proxmox storage.
-> `VM.Monitor` and `VM.PowerMgmt` are required to control the VM during the build — Terraform does not need these.
+> `VM.PowerMgmt` is required to start/stop the VM during the build — Terraform does not need this.
 > Packer does NOT need VM.Clone or SDN.Use — it builds from ISO, not from an existing template.
 >
 > Then create an API token for `packer@pve` (same UI path as Step 1.2). Store the Token ID and Secret immediately.
