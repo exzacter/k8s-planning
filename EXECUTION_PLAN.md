@@ -106,14 +106,38 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Also store both as GitHub Actions secrets (`PACKER_TOKEN_ID`, `PACKER_TOKEN_SECRET`) for any future CI builds.
 > Docs: https://pve.proxmox.com/wiki/User_Management
 
-**Step 1.4 — Write a Packer template for the base VM image**
-> Packer automates the entire VM template creation process — no manual Proxmox UI clicks.
-> The Packer `proxmox-iso` or `proxmox-clone` builder:
-> - Downloads the chosen Linux cloud image directly on Proxmox
-> - Creates a VM, attaches the image, boots it
-> - Runs a provisioner shell script: installs `qemu-guest-agent`, enables it, disables swap, applies updates
-> - Converts the VM to a Proxmox template automatically
-> Store the Packer template in `packer/` in the repo. Name it to match your chosen distro (e.g. `packer/ubuntu-2404.pkr.hcl`, `packer/debian-12.pkr.hcl`, `packer/fedora-40.pkr.hcl`).
+**Step 1.4 — Understand what you are building before writing any Packer config**
+> A Proxmox VM template is a locked, non-bootable VM image that Terraform clones for every k8s node. You do not touch it after creation — Terraform and cloud-init handle all per-VM configuration at clone time.
+> Read these two Proxmox docs before writing anything:
+> 1. What a VM template is and how it is created from a VM: https://pve.proxmox.com/wiki/VM_Templates_and_Clones
+> 2. How Proxmox cloud-init works and why the template must include a cloud-init drive: https://pve.proxmox.com/wiki/Cloud-Init_Support
+>
+> **Which Packer builder to use — and why**
+> Packer has two Proxmox builders:
+>
+> | Builder | Starting point | When to use |
+> |---|---|---|
+> | `proxmox-iso` | A raw OS ISO | First-time setup — no template exists yet, so you build from scratch |
+> | `proxmox-clone` | An existing Proxmox VM template | You already have a base template and want to layer changes on top of it |
+>
+> Use `proxmox-iso` for this step. `proxmox-clone` has nothing to clone until this step produces a template.
+>
+> **What `proxmox-iso` does end-to-end:**
+> 1. Authenticates to the Proxmox API using the token from Step 1.3
+> 2. Uploads or references the OS ISO on Proxmox storage
+> 3. Creates a VM and boots it from the ISO
+> 4. Performs an unattended OS install (via preseed for Debian/Ubuntu)
+> 5. Runs a provisioner shell script: installs `qemu-guest-agent`, enables cloud-init, disables swap, applies updates
+> 6. Converts the VM to a Proxmox template and shuts it down
+>
+> Read the full `proxmox-iso` builder reference for all required and optional config fields:
+> https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox/latest/components/builder/iso
+>
+> For the unattended install step (step 4 above), read the Ubuntu/Debian preseed guide — this is how Packer installs the OS without a human at the keyboard:
+> https://developer.hashicorp.com/packer/guides/automatic-operating-system-installs/preseed_ubuntu
+>
+> After reading those four docs, you have everything needed to write the template config.
+> Store it in `packer/` in the repo, named to match your chosen distro (e.g. `packer/ubuntu-2404.pkr.hcl`).
 >
 > **Choosing a base distro for your VMs:**
 > The Packer template defines what OS all your k8s VMs (control plane and workers) run. Pick one and be consistent — your Ansible roles must match.
@@ -126,15 +150,14 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > | Arch Linux | Smallest footprint; `kubeadm`, `kubelet`, `kubectl`, `containerd` all in official repos (no extra repo setup needed); rolling release means versions advance without you pinning them |
 >
 > **Ansible roles must reflect your choice.** Sections 6.2–6.4 below show where to branch by OS family. Ubuntu/Debian are the most documented choice for homelab kubeadm setups but any of the above works.
->
-> Packer proxmox builder docs: https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox
-> Packer proxmox-clone builder: https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox/latest/components/builder/clone
 
 **Step 1.5 — Run Packer to build the template (one-time, from developer machine)**
 > Set `PROXMOX_TOKEN_ID` and `PROXMOX_TOKEN_SECRET` env vars from the `packer@pve` token created in Step 1.3, then run:
-> `packer build packer/ubuntu-2404.pkr.hcl`
+> `packer init packer/` — downloads the proxmox plugin declared in the template's `required_plugins` block.
+> `packer build packer/ubuntu-2404.pkr.hcl` — Packer authenticates to the Proxmox API, performs the full build, and registers the resulting VM as a template on Proxmox.
 > After this, the template exists on Proxmox and Terraform can clone it for every VM.
-> If the template ever needs to be rebuilt (e.g. OS updates), re-run Packer — it replaces the old template.
+> If the template ever needs rebuilding (OS updates, new packages), delete the existing template from Proxmox and re-run Packer — it creates a fresh one.
+> `proxmox-clone` builder reference (for future use, if you later need to layer on top of this template): https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox/latest/components/builder/clone
 
 **Step 1.6 — Plan and reserve IP ranges**
 > Decide on these ranges and set them as DHCP exclusions in your router before writing any Terraform.
@@ -915,7 +938,11 @@ These tools are only needed on your developer machine for the one-time bootstrap
 | Proxmox API tokens | https://pve.proxmox.com/wiki/Proxmox_VE_API#API_Tokens |
 | Proxmox cloud-init | https://pve.proxmox.com/wiki/Cloud-Init_Support |
 | Proxmox list VMs per node | https://pve.proxmox.com/pve-docs/api-viewer/#/nodes/{node}/qemu |
-| Packer proxmox builder | https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox |
+| Proxmox VM templates | https://pve.proxmox.com/wiki/VM_Templates_and_Clones |
+| Packer proxmox plugin overview | https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox |
+| Packer proxmox-iso builder | https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox/latest/components/builder/iso |
+| Packer proxmox-clone builder | https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox/latest/components/builder/clone |
+| Packer Ubuntu preseed (unattended install) | https://developer.hashicorp.com/packer/guides/automatic-operating-system-installs/preseed_ubuntu |
 | bpg/proxmox provider | https://registry.terraform.io/providers/bpg/proxmox/latest/docs |
 | bpg/proxmox VM data source | https://registry.terraform.io/providers/bpg/proxmox/latest/docs/data-sources/virtual_environment_vms |
 | Terraform for_each | https://developer.hashicorp.com/terraform/language/meta-arguments/for_each |
