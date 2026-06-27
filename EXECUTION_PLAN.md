@@ -126,18 +126,13 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > 1. Authenticates to the Proxmox API using the token from Step 1.3
 > 2. Uploads or references the OS ISO on Proxmox storage
 > 3. Creates a VM and boots it from the ISO
-> 4. Performs an unattended OS install (via preseed for Debian/Ubuntu)
-> 5. Runs a provisioner shell script: installs `qemu-guest-agent`, enables cloud-init, disables swap, applies updates
-> 6. Converts the VM to a Proxmox template and shuts it down
+> 4. Sends keystrokes to the VM console (boot_command) to trigger unattended install, pointing the installer at Packer's local HTTP server
+> 5. Ubuntu installer fetches `user-data` from Packer's HTTP server and installs the OS without human input
+> 6. Packer SSHes into the finished VM and runs provisioner shell commands (install packages, configure OS)
+> 7. Converts the VM to a Proxmox template and shuts it down
 >
 > Read the full `proxmox-iso` builder reference for all required and optional config fields:
 > https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox/latest/components/builder/iso
->
-> For the unattended install step (step 4 above), read the Ubuntu/Debian preseed guide — this is how Packer installs the OS without a human at the keyboard:
-> https://developer.hashicorp.com/packer/guides/automatic-operating-system-installs/preseed_ubuntu
->
-> After reading those four docs, you have everything needed to write the template config.
-> Store it in `packer/` in the repo, named to match your chosen distro (e.g. `packer/ubuntu-2404.pkr.hcl`).
 >
 > **Choosing a base distro for your VMs:**
 > The Packer template defines what OS all your k8s VMs (control plane and workers) run. Pick one and be consistent — your Ansible roles must match.
@@ -151,12 +146,130 @@ These tools are only needed on your developer machine for the one-time bootstrap
 >
 > **Ansible roles must reflect your choice.** Sections 6.2–6.4 below show where to branch by OS family. Ubuntu/Debian are the most documented choice for homelab kubeadm setups but any of the above works.
 
-**Step 1.5 — Run Packer to build the template (one-time, from developer machine)**
-> Set `PROXMOX_TOKEN_ID` and `PROXMOX_TOKEN_SECRET` env vars from the `packer@pve` token created in Step 1.3, then run:
-> `packer init packer/` — downloads the proxmox plugin declared in the template's `required_plugins` block.
-> `packer build packer/ubuntu-2404.pkr.hcl` — Packer authenticates to the Proxmox API, performs the full build, and registers the resulting VM as a template on Proxmox.
-> After this, the template exists on Proxmox and Terraform can clone it for every VM.
-> If the template ever needs rebuilding (OS updates, new packages), delete the existing template from Proxmox and re-run Packer — it creates a fresh one.
+**Step 1.4a — Understand the three files you need to write**
+> The Packer build for Ubuntu 24.04 requires exactly three files. Understanding what each does before writing any of them will prevent confusion:
+>
+> **File 1: `packer/ubuntu-2404.pkr.hcl`**
+> The main Packer config. Contains four blocks in order:
+> - `packer {}` — declares the required proxmox plugin and its version. Packer downloads this when you run `packer init`.
+> - `variable {}` — one block per variable. Declares what inputs the build accepts (Proxmox URL, token, node name, disk size, etc.). No sensitive values should have defaults — leave them empty so Packer errors if the env var isn't set.
+> - `source "proxmox-iso" {}` — the builder config. Describes the VM hardware, ISO location, network, disk, boot command, and SSH communicator settings.
+> - `build {}` — ties the source to provisioners. This is where you run shell commands on the VM after install (package installs, OS hardening).
+>
+> Note: the builder type is `proxmox-iso`, not `proxmox` — the old `proxmox` builder name is deprecated and will produce a warning.
+>
+> **File 2: `packer/http/user-data`**
+> The Ubuntu autoinstall config. This is a YAML file (not HCL) that the Ubuntu 24.04 installer fetches over HTTP from Packer's built-in HTTP server during the boot process. It replaces the old preseed approach used in Ubuntu 20.04 and earlier.
+> It defines: locale, keyboard, network (DHCP during install), storage layout, and crucially — the user account that gets created on the VM.
+> The username and password you define here must match `ssh_username` and `ssh_password` in your `.pkr.hcl`, because Packer uses those credentials to SSH in after install and run the provisioner.
+> This is a template-only credential — it exists only so Packer can connect. Terraform/cloud-init replaces user config on each cloned VM at deploy time.
+> Ubuntu autoinstall reference: https://ubuntu.com/server/docs/install/autoinstall-reference
+> Ubuntu autoinstall schema (full field list): https://ubuntu.com/server/docs/install/autoinstall-schema
+>
+> **File 3: `packer/http/meta-data`**
+> An empty file. Ubuntu's cloud-init/autoinstall requires both `user-data` and `meta-data` to be present at the same URL path, even if `meta-data` contains nothing. Packer serves both files from its HTTP server. If this file is missing the installer will stall waiting for it.
+>
+> **Summary of the relationship:**
+> ```
+> .pkr.hcl boot_command → tells Ubuntu installer: "fetch autoinstall config from http://<packer-ip>:<port>/"
+> Ubuntu installer → fetches http/user-data (installs OS using those settings, creates the user)
+> Ubuntu installer → fetches http/meta-data (must exist, can be empty)
+> Packer SSH communicator → connects using ssh_username/ssh_password (must match what user-data created)
+> build {} provisioner → runs shell commands on the now-running VM
+> Packer → converts VM to template
+> ```
+>
+> **File structure in your repo:**
+> ```
+> packer/
+>   ubuntu-2404.pkr.hcl
+>   http/
+>     user-data
+>     meta-data
+> ```
+>
+> Good community examples of this exact structure for Proxmox + Ubuntu 24.04:
+> - https://github.com/ChristianLempa/boilerplates/tree/main/packer/proxmox (Christian Lempa — well-maintained homelab reference)
+> - Search GitHub for `packer proxmox ubuntu 24.04` filtered by recently updated — there are many solid examples and this will surface ones that are current rather than relying on a pinned URL
+> These show the complete three-file structure with real `user-data` examples. Use them as reference, not copy-paste — your storage pool names, network bridge, and variable names will differ.
+
+**Step 1.4b — Authentication: API token vs username/password**
+> The community examples you find online (including the rkoosaar repo) often use `username` + `password` fields. Your setup uses API token auth (Step 1.3), which uses different field names in the HCL:
+>
+> | Auth method | Fields in .pkr.hcl |
+> |---|---|
+> | Username/password (old) | `username`, `password` |
+> | API token (your setup) | `username` (set to token ID format), `token` |
+>
+> For API token auth, `username` takes the full token ID in the format `packer@pve!tokenname` and `token` takes the secret value.
+> Set both via environment variables (`PKR_VAR_proxmox_token_id`, `PKR_VAR_proxmox_token_secret`) — never hardcode in the HCL.
+> Mark `proxmox_token_secret` with `sensitive = true` in its variable block so Packer redacts it from build output.
+
+**Step 1.4c — The boot_command field and what it actually does**
+> `boot_command` is a list of keystrokes Packer sends to the VM's VNC console immediately after it boots from the ISO. It is the bridge between "VM boots from ISO" and "Ubuntu installer fetches your user-data".
+>
+> For Ubuntu 24.04 server, the boot screen uses GRUB. The sequence is:
+> 1. Wait for GRUB to appear (`<wait>` entries give it time)
+> 2. Press `e` to open the selected boot entry for editing
+> 3. Navigate to the end of the `linux` kernel line
+> 4. Append `autoinstall ds=nocloud-net;s=http://{{ .HTTPIP }}:{{ .HTTPPort }}/` to the kernel parameters
+> 5. Press `F10` or `ctrl+x` to boot with the modified parameters
+>
+> `{{ .HTTPIP }}` and `{{ .HTTPPort }}` are Packer template variables resolved at build time to the IP and port of Packer's built-in HTTP server running on your machine.
+>
+> `ds=nocloud-net;s=http://...` tells Ubuntu's cloud-init datasource where to fetch `user-data` and `meta-data`.
+>
+> The exact boot_command for Ubuntu 24.04 differs from 20.04 — use a 24.04-specific example as reference rather than adapting a 20.04 one. The rkoosaar repo targets 20.04; its boot_command will not work without modification.
+> Search GitHub for `packer proxmox ubuntu 24.04` to find current examples with the correct boot_command sequence.
+
+**Step 1.4d — What the provisioner block does and what to put in it**
+> After the OS installs and Packer SSHes in, the `build {}` block runs provisioner commands on the live VM before converting it to a template. This is where you bake k8s prerequisites into the image so Terraform doesn't have to install them every time it clones a new node.
+>
+> What to install/configure in the provisioner for a k8s node template:
+> - `qemu-guest-agent` — required for Proxmox to report VM IP addresses and for clean shutdown signals
+> - Disable swap — k8s requires swap to be off; do it in the template so it's always correct
+> - Load kernel modules: `overlay`, `br_netfilter` — required by containerd and the k8s networking stack
+> - Set sysctl params: `net.bridge.bridge-nf-call-iptables=1`, `net.ipv4.ip_forward=1` — required for pod networking
+> - `apt-get update && apt-get upgrade -y` — ensure the template starts with current packages
+> - Optionally: install `containerd` — saves time at node deploy; version-pin it to match what your Ansible roles expect
+>
+> Do NOT join the cluster or set a hostname in the provisioner — those are per-VM concerns handled by Terraform cloud-init at clone time. The template should be generic.
+>
+> After provisioner runs, Packer sets `template_description`, converts the VM to a template, and disconnects. The VM is now locked in Proxmox and cannot be booted directly — only cloned.
+
+**Step 1.5 — Run Packer to build the template**
+> Before running, ensure your storage pool name in the HCL matches what actually exists on that Proxmox node. Check in the Proxmox UI under Datacenter → Storage. Common names are `local-lvm`, `local`, or a custom name you set up. Using a wrong storage pool name is the most common first-run failure.
+>
+> Set env vars from the `packer@pve` token created in Step 1.3:
+> ```
+> export PKR_VAR_proxmox_token_id="packer@pve!yourtoken"
+> export PKR_VAR_proxmox_token_secret="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+> export PKR_VAR_proxmox_node="pve1"
+> ```
+>
+> Then run:
+> `packer init packer/` — downloads the proxmox plugin declared in `required_plugins`. Only needed once per machine.
+> `packer validate packer/ubuntu-2404.pkr.hcl` — checks HCL syntax and variable references without running a build. Run this first.
+> `packer build packer/ubuntu-2404.pkr.hcl` — performs the full build on the node specified by `PKR_VAR_proxmox_node`.
+>
+> **Build failures and where to look:**
+> - Packer output streams to stdout in real time. If it stalls at "Waiting for SSH", the install is either still running (normal — can take 5–10 min) or the boot_command didn't trigger autoinstall correctly.
+> - Open the Proxmox UI, find the VM Packer created (named whatever `vm_name` is set to), and open its Console tab. You can watch the install live.
+> - If the console shows the Ubuntu installer menu waiting for input, the boot_command didn't execute correctly.
+> - If the console shows install progress, Packer is working — just waiting.
+>
+> **Running on all 4 nodes (no shared storage):**
+> Because your Proxmox nodes don't share storage, each node needs its own local copy of the template. Run Packer once per node, changing only the target node each time:
+> ```
+> PKR_VAR_proxmox_node=pve1 packer build packer/ubuntu-2404.pkr.hcl
+> PKR_VAR_proxmox_node=pve2 packer build packer/ubuntu-2404.pkr.hcl
+> PKR_VAR_proxmox_node=pve3 packer build packer/ubuntu-2404.pkr.hcl
+> PKR_VAR_proxmox_node=pve4 packer build packer/ubuntu-2404.pkr.hcl
+> ```
+> Run them sequentially, not in parallel — each build creates a VM with the same `vm_id` (e.g. 9000) and the same name on its respective node, which is fine since they are on separate nodes. The resulting template will have the same name on all 4 nodes, which is what Terraform expects when it clones to a specific node.
+>
+> If the template ever needs rebuilding (OS updates, new packages): delete the existing template from each Proxmox node via the UI, then re-run all 4 builds.
+>
 > `proxmox-clone` builder reference (for future use, if you later need to layer on top of this template): https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox/latest/components/builder/clone
 
 **Step 1.6 — Plan and reserve IP ranges**
