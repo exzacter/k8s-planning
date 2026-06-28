@@ -603,10 +603,19 @@ These tools are only needed on your developer machine for the one-time bootstrap
 
 **Step 7.7 — Write Velero manifest in `k8s/backup/`**
 > An ArgoCD `Application` pointing to the Velero Helm chart deployed to the `velero` namespace.
-> Helm values: set the object storage backend to MinIO (same MinIO used for Terraform state), configure credentials, enable the default backup storage location.
-> A `Schedule` CRD resource in the same directory triggers a daily full backup at 02:00 with 7-day retention.
-> A separate `CronJob` manifest on each control plane node runs `etcdctl snapshot save` nightly and uploads the snapshot to MinIO under an `etcd/` prefix.
+> Configure **two** `BackupStorageLocation` resources — this is what gives you 3-2-1:
+> - `local` (default): MinIO on Proxmox (`http://192.168.1.60:9000`) — fast local restore, same site
+> - `offsite`: Backblaze B2 — S3-compatible endpoint (`https://s3.us-west-004.backblazeb2.com`), different physical location
+>
+> Both locations receive every backup. Velero supports multiple storage locations natively — set `default: true` on the MinIO location so restores default to local (faster), with B2 available as the DR target.
+> A `Schedule` CRD triggers a daily full backup at 02:00 with 7-day retention, writing to both locations.
+> A separate `CronJob` on each control plane node runs `etcdctl snapshot save` nightly and uploads to both MinIO (`etcd/` prefix) and Backblaze B2 (`etcd/` prefix) via `rclone` or `aws s3 cp --endpoint-url`.
+>
+> This satisfies 3-2-1: live cluster (copy 1) + local MinIO (copy 2, local) + Backblaze B2 (copy 3, offsite, different medium).
+> **DR recovery sequence**: Rebuild infra (Packer → Terraform → Ansible → kubeadm) → bootstrap ArgoCD → `velero restore --from-backup <name> --storage-location offsite` → verify.
 > No manual backup triggers — everything is GitOps-managed and runs automatically once ArgoCD syncs it.
+> Velero multiple storage locations: https://velero.io/docs/latest/api-types/backupstoragelocation/
+> Backblaze B2 S3-compatible docs: https://www.backblaze.com/docs/cloud-storage-s3-compatible-api
 > Reference: https://velero.io/docs/latest/basic-install/
 > Velero Helm chart: https://vmware-tanzu.github.io/helm-charts/
 
@@ -652,6 +661,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > bao kv put secret/github pat=<value>
 > bao kv put secret/discord webhook_url=<value>
 > bao kv put secret/minio access_key=<value> secret_key=<value>
+> bao kv put secret/backblaze access_key=<keyID> secret_key=<applicationKey>
 > ```
 > These replace the equivalent GitHub Secrets entries — GitHub Secrets only retains the credentials needed by workflows before the cluster exists (TF_API_TOKEN, PROXMOX_API_TOKEN_ID/SECRET, ANSIBLE_SSH_PRIVATE_KEY, OPENBAO_ADDR, OPENBAO_TOKEN).
 
@@ -904,16 +914,23 @@ These tools are only needed on your developer machine for the one-time bootstrap
 
 ## Phase 11: GitHub Actions Secrets
 
-**Step 11.0 — Deploy MinIO on Proxmox (prerequisite for Velero and optional TF state)**
-> MinIO must exist before the bootstrap workflow runs because Velero (deployed by ArgoCD in Phase 9 step 12) immediately tries to connect to it.
+**Step 11.0 — Deploy MinIO on Proxmox and configure Backblaze B2 (prerequisites for Velero)**
+> Both storage targets must exist before the bootstrap workflow runs — Velero (deployed by ArgoCD in Phase 9 step 12) immediately tries to connect to its configured storage locations.
+>
+> **MinIO (local — copy 2 of 3):**
 > MinIO is not a Kubernetes workload — run it as a standalone VM on Proxmox (outside the k8s cluster) so it remains available during cluster rebuilds.
-> Steps:
 > 1. Clone the Packer template to create a small Proxmox VM (2 CPU, 4 GB RAM, 100 GB disk)
-> 2. Install MinIO: https://min.io/docs/minio/linux/index.html
-> 3. Create two buckets: `velero` (for Velero backups and etcd snapshots) and `tfstate` (for Terraform state if migrating from Terraform Cloud later)
-> 4. Create a MinIO access key and secret key with read/write access to the `velero` bucket
-> 5. Note the MinIO endpoint URL (e.g. `http://192.168.1.60:9000`) — this goes into the Velero Helm values
-> Assign this VM a static IP outside the k8s IP ranges from Step 1.5 (e.g. `192.168.1.60`).
+> 2. Assign a static IP outside the k8s IP ranges (e.g. `192.168.1.60`)
+> 3. Install MinIO: https://min.io/docs/minio/linux/index.html
+> 4. Create two buckets: `velero` (Velero backups + etcd snapshots) and `tfstate` (OpenTofu state)
+> 5. Create a MinIO access key and secret key with read/write access to both buckets
+>
+> **Backblaze B2 (offsite — copy 3 of 3):**
+> 1. Sign up at https://www.backblaze.com/sign-up/cloud-storage — free tier includes 10 GB; beyond that ~$6/TB/month
+> 2. Create a bucket named `k8s-velero-offsite` (set to private)
+> 3. Create an application key with read/write access to that bucket only — note the `keyID` and `applicationKey`
+> 4. B2 S3-compatible endpoint format: `https://s3.<region>.backblazeb2.com` — find your bucket's region in the B2 UI
+> 5. Store `keyID` as `B2_ACCESS_KEY` and `applicationKey` as `B2_SECRET_KEY` in OpenBao (`bao kv put secret/backblaze access_key=<keyID> secret_key=<applicationKey>`)
 
 **Step 11.1 — Store all secrets in GitHub Actions**
 > GitHub repo → Settings → Secrets and variables → Actions.
@@ -1032,12 +1049,16 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > If no logs appear: check `kubectl get pods -n monitoring` to confirm Promtail DaemonSet pods are all Running on every node.
 > Loki datasource must appear in Grafana's datasource list (provisioned via the ConfigMap written in Step 7.6).
 
-**Step 13.7 — Verify Velero backup ran**
+**Step 13.7 — Verify Velero backup ran to both storage locations**
 > Run `velero backup get` — you should see a backup created within the last 24 hours with status `Completed`.
 > Run `velero backup describe <backup-name>` to confirm it backed up resources across all namespaces.
-> Confirm the MinIO `velero` bucket received the backup artifacts: `mc ls minio/velero/` from the MinIO VM.
+> Confirm both storage locations received the backup:
+> - Local: `mc ls minio/velero/` from the MinIO VM — artifacts present
+> - Offsite: `velero backup get --storage-location offsite` — shows same backup with `Completed` status
 > Check the etcd CronJob: `kubectl get cronjob -n kube-system` should list `etcd-backup`; `kubectl get jobs -n kube-system` should show it ran successfully.
-> If Velero backup shows `Failed`: check MinIO credentials (Step 11.1 MINIO_ACCESS_KEY/MINIO_SECRET_KEY) are correctly injected into the Velero Helm values and the MinIO `velero` bucket exists.
+> Verify 3-2-1 compliance: `velero get backup-locations` should list two locations (`local` and `offsite`), both showing `Available` phase.
+> If `offsite` location shows `Unavailable`: check B2 credentials are correctly loaded into the Velero `BackupStorageLocation` secret via ESO.
+> If `local` backup shows `Failed`: check MinIO credentials are correctly injected into the Velero Helm values and the MinIO `velero` bucket exists.
 
 **Step 13.8 — Verify pve-exporter metrics in Grafana**
 > Open Grafana → Explore → select the Prometheus datasource.
