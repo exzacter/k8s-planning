@@ -12,7 +12,7 @@ These cannot be automated because they are either initial credentials that must 
 
 - Creating the Proxmox API user and token (chicken-and-egg — the token is what automation uses)
 - Deciding IP ranges (Step 1.5 — your router/LAN layout)
-- Creating Terraform Cloud account and organisation (web signup)
+- Creating the Backblaze B2 account and bucket (web signup — offsite backup target)
 - Registering the GitHub Actions runner (GitHub generates the token in the UI)
 - Populating GitHub Secrets (you cannot script secret injection)
 - Creating the Discord webhook URL and Discord Application (Discord UI)
@@ -304,23 +304,39 @@ These tools are only needed on your developer machine for the one-time bootstrap
 
 ---
 
-## Phase 2: Terraform Cloud State Backend
+## Phase 2: OpenTofu State Backend (MinIO S3)
 
-**Step 2.1 — Create a Terraform Cloud account and organisation**
-> Sign up at https://app.terraform.io — free tier is sufficient.
+> OpenTofu state is stored on the local MinIO VM (already deployed in Phase 11.0 for Velero). This eliminates any dependency on a third-party service — state never leaves your LAN.
+> OpenTofu's `s3` backend is a protocol, not a service — it works with any S3-compatible endpoint including MinIO.
 
-**Step 2.2 — Create a workspace in CLI-driven mode**
-> CLI-driven means Terraform runs in GitHub Actions, not inside HCP.
-> Name it `k8s-proxmox`.
-> Docs: https://developer.hashicorp.com/terraform/cloud-docs/workspaces/creating
+**Step 2.1 — Create the `tfstate` bucket in MinIO**
+> MinIO UI or CLI: `mc mb minio/tfstate`
+> This bucket already exists if you followed Step 11.0 — just confirm it is present before continuing.
 
-**Step 2.3 — Generate a Terraform Cloud API token**
-> Account Settings → Tokens → Create API token.
-> Docs: https://developer.hashicorp.com/terraform/cloud-docs/users-teams-organizations/api-tokens
+**Step 2.2 — Configure the S3 backend in `terraform/versions.tf`**
+> ```hcl
+> terraform {
+>   backend "s3" {
+>     bucket                      = "tfstate"
+>     key                         = "k8s-proxmox/terraform.tfstate"
+>     region                      = "us-east-1"        # required by the S3 protocol; MinIO ignores it
+>     endpoint                    = "http://192.168.1.60:9000"
+>     access_key                  = var.minio_access_key
+>     secret_key                  = var.minio_secret_key
+>     skip_credentials_validation = true
+>     skip_metadata_api_check     = true
+>     skip_region_validation      = true
+>     force_path_style            = true
+>     use_lockfile                = true               # OpenTofu 1.8+ native S3 locking — no DynamoDB needed
+>   }
+> }
+> ```
+> `use_lockfile = true` writes a `.tflock` file alongside state to prevent concurrent applies — no external lock service required.
+> Docs: https://opentofu.org/docs/language/settings/backends/s3/
 
-**Step 2.4 — Authenticate your local OpenTofu CLI**
-> `tofu login` — stores the token locally for the bootstrap phase. This project uses OpenTofu (`tofuenv` + `tofu` CLI), not the HashiCorp Terraform binary.
-> Docs: https://opentofu.org/docs/cli/commands/login/
+**Step 2.3 — Initialise the backend from your developer machine**
+> `tofu init` — OpenTofu connects to MinIO, creates the state file in the `tfstate` bucket, and confirms the lock mechanism works.
+> MinIO must be reachable from your developer machine — if you are not on the LAN, use a VPN or SSH tunnel to `192.168.1.60:9000` first.
 
 ---
 
@@ -369,7 +385,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Exclude: `*.tfstate`, `*.tfstate.backup`, `.terraform/`, `*.tfvars`, `ansible/inventory/hosts.ini`, `kubeconfig`, `packer/manifest.json`
 
 **Step 4.3 — Create `terraform/versions.tf`**
-> Declare pinned OpenTofu version (managed via `tofuenv` — see `.terraform-version` file), `bpg/proxmox` provider version, and the Terraform Cloud backend block. Use `required_version` with an OpenTofu version string, not a HashiCorp Terraform version.
+> Declare pinned OpenTofu version (managed via `tofuenv` — see `.terraform-version` file), `bpg/proxmox` provider version, and the MinIO S3 backend block (configured in Phase 2). Use `required_version` with an OpenTofu version string.
 > Provider version reference: https://registry.terraform.io/providers/bpg/proxmox/latest
 
 **Step 4.4 — Create `renovate.json` in the repo root**
@@ -663,7 +679,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > bao kv put secret/minio access_key=<value> secret_key=<value>
 > bao kv put secret/backblaze access_key=<keyID> secret_key=<applicationKey>
 > ```
-> These replace the equivalent GitHub Secrets entries — GitHub Secrets only retains the credentials needed by workflows before the cluster exists (TF_API_TOKEN, PROXMOX_API_TOKEN_ID/SECRET, ANSIBLE_SSH_PRIVATE_KEY, OPENBAO_ADDR, OPENBAO_TOKEN).
+> These replace the equivalent GitHub Secrets entries — GitHub Secrets only retains the credentials needed by workflows before the cluster exists (PROXMOX_API_TOKEN_ID/SECRET, ANSIBLE_SSH_PRIVATE_KEY, OPENBAO_ADDR, OPENBAO_TOKEN).
 
 **Step 7d.4 — Enable Kubernetes auth method (configured after bootstrap)**
 > The k8s auth method lets pods authenticate to OpenBao using their ServiceAccount token — no static credentials needed inside the cluster.
@@ -936,7 +952,6 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > GitHub repo → Settings → Secrets and variables → Actions.
 > Only the secrets GitHub Actions needs BEFORE the cluster exists go here. All others live in OpenBao and are synced into the cluster by ESO.
 > Required secrets:
-> - `TF_API_TOKEN` — Terraform Cloud API token
 > - `PROXMOX_API_TOKEN_ID` — Proxmox API token ID
 > - `PROXMOX_API_TOKEN_SECRET` — Proxmox API token secret
 > - `ANSIBLE_SSH_PRIVATE_KEY` — Ansible SSH private key
@@ -946,10 +961,9 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Note: `KUBECONFIG_B64` is written automatically by the bootstrap workflow (Step 9.1 step 14).
 > Discord webhook URL, MinIO credentials, and all other runtime secrets are loaded into OpenBao (Step 7d.3) and synced into k8s Secrets by ESO post-bootstrap.
 
-**Step 11.2 — Set Terraform Cloud workspace environment variables**
-> Proxmox credentials set as sensitive environment variables in Terraform Cloud workspace.
-> This keeps them out of workflow YAML files entirely.
-> Docs: https://developer.hashicorp.com/terraform/cloud-docs/workspaces/variables
+**Step 11.2 — Confirm MinIO is reachable from the self-hosted runner**
+> The runner VM needs network access to MinIO (`http://192.168.1.60:9000`) for every `tofu init/plan/apply` — both are on the LAN so this should work automatically.
+> Test from the runner: `curl -s http://192.168.1.60:9000/minio/health/live` — a 200 response confirms MinIO is up and reachable.
 
 ---
 
@@ -1083,9 +1097,8 @@ These tools are only needed on your developer machine for the one-time bootstrap
 | bpg/proxmox provider | https://registry.terraform.io/providers/bpg/proxmox/latest/docs |
 | bpg/proxmox VM data source | https://registry.terraform.io/providers/bpg/proxmox/latest/docs/data-sources/virtual_environment_vms |
 | OpenTofu for_each | https://opentofu.org/docs/language/meta-arguments/for_each/ |
-| OpenTofu tofu login | https://opentofu.org/docs/cli/commands/login/ |
+| OpenTofu S3 backend (MinIO) | https://opentofu.org/docs/language/settings/backends/s3/ |
 | OpenTofu tofu show | https://opentofu.org/docs/cli/commands/show/ |
-| Terraform Cloud workspaces | https://developer.hashicorp.com/terraform/cloud-docs/workspaces/creating |
 | Terraform GitHub Actions (workflow reference) | https://developer.hashicorp.com/terraform/tutorials/automation/github-actions |
 | GitHub self-hosted runners | https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners |
 | GitHub Environments (approval gates) | https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment |
