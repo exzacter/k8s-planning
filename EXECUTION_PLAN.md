@@ -364,9 +364,12 @@ These tools are only needed on your developer machine for the one-time bootstrap
 >
 > **Backblaze B2 (offsite — copy 3 of 3 for 3-2-1):**
 > 1. Sign up at https://www.backblaze.com/sign-up/cloud-storage — free tier includes 10 GB; beyond that ~$6/TB/month
-> 2. Create a private bucket named `k8s-velero-offsite`
-> 3. Create an application key scoped to that bucket only — note the `keyID` and `applicationKey`
-> 4. Select **US West** region when creating the bucket — closest to Australia via transpacific cable, best upload throughput. S3 endpoint: `https://s3.us-west-004.backblazeb2.com`
+> 2. Create a private bucket named `k8s-velero-offsite` with these settings at creation time (both are permanent — cannot be changed after bucket is created):
+>    - **Region**: US West — closest to Australia via transpacific cable. S3 endpoint: `https://s3.us-west-004.backblazeb2.com`
+>    - **Object Lock**: Enabled — required for ransomware protection; also enables versioning automatically
+>    - **Server-Side Encryption (SSE)**: Enabled — B2-managed keys, encrypts data at rest, free
+> 3. Set the default object lock retention: **Governance mode, 10 days** — slightly longer than Velero's 7-day backup retention to prevent race conditions when Velero deletes expired backups. Governance mode (not Compliance) allows you to override the lock if needed.
+> 4. Create an application key scoped to that bucket only — note the `keyID` and `applicationKey`
 > 5. Store both in KeePassXC for now — they go into OpenBao in Step 7d.3 once OpenBao exists
 
 ---
