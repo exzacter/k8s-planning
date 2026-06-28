@@ -308,12 +308,51 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > These must exist before Phase 2 (OpenTofu state backend) and before the bootstrap workflow (Velero). Set them up now while you are doing Proxmox preparation.
 >
 > **MinIO (local — copy 2 of 3 for 3-2-1):**
-> MinIO is not a Kubernetes workload — run it as a standalone VM on Proxmox so it survives cluster rebuilds.
-> 1. Clone the Packer template to create a small Proxmox VM (2 CPU, 4 GB RAM, 100 GB disk)
-> 2. Assign static IP `192.168.1.60` (reserved in Step 1.6) and exclude it from DHCP
-> 3. Install MinIO: https://min.io/docs/minio/linux/index.html
-> 4. Create two buckets: `tfstate` (OpenTofu state) and `velero` (Velero backups + etcd snapshots)
-> 5. Create a MinIO access key and secret key with read/write access to both buckets — note both values
+> MinIO runs on **pve4** — the node that runs only worker VMs and no control plane. This means a single node failure cannot simultaneously take out the cluster's API server and the backup storage.
+> MinIO is not a Kubernetes workload — it runs as a standalone VM so it survives cluster rebuilds.
+>
+> The VM uses two disks: a small OS disk on local storage, and a large data disk backed by your NAS. This gives MinIO access to NAS-scale storage without consuming Proxmox local-lvm space.
+>
+> **Step 1.8.1 — Add your NAS as a Proxmox storage backend**
+> Proxmox UI → Datacenter → Storage → Add → NFS (or SMB if your NAS speaks SMB):
+> - ID: `nas` (or any name — this becomes the Proxmox storage pool name)
+> - Server: your NAS IP
+> - Export: the NFS share path on your NAS
+> - Content: `Disk image` (and optionally `ISO` if you want to store ISOs there too)
+> Once added, `nas` appears as a storage pool on every Proxmox node that has access to it.
+> Proxmox NFS storage docs: https://pve.proxmox.com/wiki/Storage:_NFS
+>
+> **Step 1.8.2 — Create the MinIO VM on pve4**
+> Proxmox UI → pve4 → Create VM:
+> - 2 CPU, 4 GB RAM
+> - Disk 1 (OS): 20 GB on `local-lvm` (fast local boot disk)
+> - Disk 2 (data): as large as you want to allocate from `nas` storage pool — this is where MinIO stores all bucket data
+> Clone the Packer template for the OS, then in the VM hardware settings add the second disk on the `nas` pool.
+> Assign static IP `192.168.1.60` (reserved in Step 1.6) via cloud-init or `/etc/netplan/` after first boot.
+>
+> **Step 1.8.3 — Mount the data disk and install MinIO**
+> SSH into the VM, partition and format the data disk (`/dev/sdb` or similar), mount it at `/data`:
+> ```
+> mkfs.xfs /dev/sdb
+> mkdir /data
+> echo '/dev/sdb /data xfs defaults 0 2' >> /etc/fstab
+> mount -a
+> ```
+> Install MinIO pointing its data directory at `/data`:
+> ```
+> wget https://dl.min.io/server/minio/release/linux-amd64/minio
+> chmod +x minio && mv minio /usr/local/bin/
+> mkdir /data/minio
+> MINIO_ROOT_USER=admin MINIO_ROOT_PASSWORD=<strong-password> minio server /data/minio --console-address ":9001" &
+> ```
+> Configure MinIO as a systemd service so it starts on boot.
+> MinIO install reference: https://min.io/docs/minio/linux/index.html
+>
+> **Step 1.8.4 — Create buckets and access keys**
+> MinIO console at `http://192.168.1.60:9001` (or via `mc`):
+> 1. Create bucket `tfstate` — for OpenTofu state
+> 2. Create bucket `velero` — for Velero backups and etcd snapshots
+> 3. Create an access key and secret key with read/write access to both buckets — note both values
 >
 > **Backblaze B2 (offsite — copy 3 of 3 for 3-2-1):**
 > 1. Sign up at https://www.backblaze.com/sign-up/cloud-storage — free tier includes 10 GB; beyond that ~$6/TB/month
