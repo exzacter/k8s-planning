@@ -289,15 +289,24 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > | Workers — pve2 (max 6) | 6 | 192.168.1.110–115 |
 > | Workers — pve3 (max 4) | 4 | 192.168.1.120–123 |
 > | Workers — pve4 (max 2) | 2 | 192.168.1.130–131 |
-> | Self-hosted runner VM | 1 | 192.168.1.50 |
-> | MinIO VM (OpenTofu state + Velero backups) | 1 | 192.168.1.60 |
-> | OpenBao VM (secrets management) | 1 | 192.168.1.61 |
+> | Self-hosted runner VM (pve3) | 1 | 192.168.1.50 |
+> | MinIO VM (pve4) | 1 | 192.168.1.60 |
+> | OpenBao VM (pve2) | 1 | 192.168.1.61 |
 > | MetalLB pool (LoadBalancer Services) | 20 | 192.168.1.200–219 |
 >
+> **Infrastructure VM placement summary:**
+>
+> | Node | Kubernetes role | Infrastructure VM |
+> |---|---|---|
+> | pve1 | Primary control plane | — |
+> | pve2 | Secondary control plane | OpenBao (192.168.1.61) |
+> | pve3 | Secondary control plane | GitHub Actions runner (192.168.1.50) |
+> | pve4 | Workers only | MinIO (192.168.1.60) |
+>
+> No single node failure takes out more than one critical service. pve4 runs workers only — never control plane VMs.
 > The per-node worker ranges will be codified in `terraform/node_capacities.json` in Phase 5a.
 > CP IPs and VIP will be hardcoded as defaults in `terraform/variables.tf` in Phase 5b.
 > Adjust ranges to your actual LAN subnet — the above are illustrative only.
-> pve4 will only run worker VMs, never control plane VMs.
 
 **Step 1.7 — Verify Proxmox API access from your developer machine**
 > Use curl to call `GET /api2/json/nodes` with the `terraform@pve` API token from Step 1.2.
@@ -404,8 +413,10 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > GitHub-hosted runners cannot reach your home LAN. Every workflow must run on this self-hosted runner.
 
 **Step 3.1 — Create the runner VM on Proxmox**
-> Use the Proxmox UI to clone the template from Phase 1.4 — this is the only VM created outside Terraform.
+> Create on **pve3** — which runs a secondary control plane VM but no other infrastructure VMs. Placing the runner here means a pve3 failure loses a secondary CP (keepalived VIP moves to pve1/pve2 automatically) but leaves MinIO (pve4) and OpenBao (pve2) unaffected.
+> Use the Proxmox UI to clone the Packer template on pve3 — this is the only VM created outside Terraform.
 > The runner is not a k8s node. It needs network access to: Proxmox API, all VM IPs, and the internet.
+> Assign static IP `192.168.1.50` (reserved in Step 1.6).
 > Specs: 2 CPU, 4 GB RAM, 20 GB disk is sufficient.
 
 **Step 3.2 — Register the runner with your GitHub repo**
@@ -709,8 +720,9 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > This VM must be provisioned before the bootstrap workflow runs (same as MinIO).
 
 **Step 7d.1 — Provision the OpenBao VM on Proxmox**
-> Clone the Packer template to a new VM: 2 CPU, 2 GB RAM, 20 GB disk.
-> Assign a static IP outside the k8s IP ranges from Step 1.5 (e.g. `192.168.1.61`).
+> Create on **pve2** — which runs a secondary control plane VM but no other infrastructure VMs. A pve2 failure loses a secondary CP (keepalived VIP handles this) and takes OpenBao offline, but existing secrets already synced into k8s Secrets by ESO remain cached in the cluster. MinIO (pve4) and the runner (pve3) are unaffected.
+> Clone the Packer template on pve2: 2 CPU, 2 GB RAM, 20 GB disk.
+> Assign static IP `192.168.1.61` (reserved in Step 1.6).
 > SSH in and install OpenBao:
 > ```
 > curl -fsSL https://apt.releases.opentofu.org/gpg | sudo gpg --dearmor -o /usr/share/keyrings/opentofu.gpg
