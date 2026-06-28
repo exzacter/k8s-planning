@@ -95,10 +95,12 @@ These tools are only needed on your developer machine for the one-time bootstrap
 **Step 1.3 — Create a dedicated Proxmox user and API token for Packer**
 > Do not reuse `terraform@pve` — Packer needs a different permission set.
 > Create `packer@pve` with these roles:
-> VM.Allocate, VM.Config.*, VM.PowerMgmt, VM.Audit, Datastore.AllocateSpace, Datastore.Audit, Sys.Modify.
-> `Sys.Modify` is required for Packer to upload ISOs to Proxmox storage.
-> `VM.PowerMgmt` is required to start/stop the VM during the build — Terraform does not need this.
-> Packer does NOT need VM.Clone or SDN.Use — it builds from ISO, not from an existing template.
+> VM.Allocate, VM.Config.*, VM.PowerMgmt, VM.Audit, VM.GuestAgent.Audit, VM.GuestAgent.Unrestricted, Datastore.AllocateSpace, Datastore.Allocate, Datastore.AllocateTemplate, Datastore.Audit, SDN.Use.
+> `VM.GuestAgent.Audit` and `VM.GuestAgent.Unrestricted` are **critical** — without them, the Proxmox API returns 403 when Packer queries `/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces` to discover the VM's IP address. Packer silently retries until `ssh_timeout` expires with no useful error. Symptoms: VM boots, installs, SSH is reachable manually, but Packer never connects.
+> `Datastore.Allocate` and `Datastore.AllocateTemplate` are required for Packer to upload the cidata ISO to Proxmox storage.
+> `SDN.Use` is required when vmbr0 is managed by the Proxmox SDN zone (zone named "localnetwork" by default) — without it, VM network creation fails.
+> `VM.PowerMgmt` is required to start/stop the VM during the build — Terraform also needs this.
+> Packer does NOT need VM.Clone — it builds from ISO, not from an existing template.
 >
 > Then create an API token for `packer@pve` (same UI path as Step 1.2). Store the Token ID and Secret immediately.
 > Export as environment variables before running `packer build`:
@@ -126,13 +128,14 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > 1. Authenticates to the Proxmox API using the token from Step 1.3
 > 2. Uploads or references the OS ISO on Proxmox storage
 > 3. Creates a VM and boots it from the ISO
-> 4. Sends keystrokes to the VM console (boot_command) to trigger unattended install, pointing the installer at Packer's local HTTP server
-> 5. Ubuntu installer fetches `user-data` from Packer's HTTP server and installs the OS without human input
+> 4. Sends keystrokes to the VM console (boot_command) to inject `autoinstall` into the kernel cmdline and trigger unattended install; the autoinstall config is read from a cidata CD-ROM attached to the VM (Ubuntu 24.04 uses autoinstall/subiquity — not the legacy preseed method)
+> 5. Ubuntu installer reads `user-data` from the cidata ISO and installs the OS without human input
 > 6. Packer SSHes into the finished VM and runs provisioner shell commands (install packages, configure OS)
 > 7. Converts the VM to a Proxmox template and shuts it down
 >
 > Read the full `proxmox-iso` builder reference for all required and optional config fields:
 > https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox/latest/components/builder/iso
+>
 >
 > **Choosing a base distro for your VMs:**
 > The Packer template defines what OS all your k8s VMs (control plane and workers) run. Pick one and be consistent — your Ansible roles must match.
@@ -315,9 +318,9 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Account Settings → Tokens → Create API token.
 > Docs: https://developer.hashicorp.com/terraform/cloud-docs/users-teams-organizations/api-tokens
 
-**Step 2.4 — Authenticate your local Terraform CLI**
-> `terraform login` — stores the token locally for the bootstrap phase.
-> Docs: https://developer.hashicorp.com/terraform/cli/commands/login
+**Step 2.4 — Authenticate your local OpenTofu CLI**
+> `tofu login` — stores the token locally for the bootstrap phase. This project uses OpenTofu (`tofuenv` + `tofu` CLI), not the HashiCorp Terraform binary.
+> Docs: https://opentofu.org/docs/cli/commands/login/
 
 ---
 
@@ -366,7 +369,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Exclude: `*.tfstate`, `*.tfstate.backup`, `.terraform/`, `*.tfvars`, `ansible/inventory/hosts.ini`, `kubeconfig`, `packer/manifest.json`
 
 **Step 4.3 — Create `terraform/versions.tf`**
-> Declare pinned Terraform version, `bpg/proxmox` provider version, and the Terraform Cloud backend block.
+> Declare pinned OpenTofu version (managed via `tofuenv` — see `.terraform-version` file), `bpg/proxmox` provider version, and the Terraform Cloud backend block. Use `required_version` with an OpenTofu version string, not a HashiCorp Terraform version.
 > Provider version reference: https://registry.terraform.io/providers/bpg/proxmox/latest
 
 **Step 4.4 — Create `renovate.json` in the repo root**
@@ -466,12 +469,12 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Output: map of CP node names → IPs (all three), VIP address, map of worker names → IPs, map of worker names → Proxmox nodes.
 > Worker IPs in the output are the same values that were passed in via the workers map — Terraform is not discovering them, it is echoing back what the workflow gave it.
 > The CP IPs and VIP feed into Ansible inventory generation. The worker map feeds the remove-worker workflow so it knows which Proxmox node to destroy a given VM on.
-> The deploy-worker and remove-worker workflows both use `terraform show -json` to read current state rather than relying on output files, so state is always authoritative.
+> The deploy-worker and remove-worker workflows both use `tofu show -json` to read current state rather than relying on output files, so state is always authoritative.
 
 **Step 5.6 — Create a CI workflow for `terraform plan` on pull requests**
 > File: `.github/workflows/terraform-plan.yml`
 > Trigger: pull request that modifies any file under `terraform/`
-> Steps: `terraform init` → `terraform plan` → post the plan output as a PR comment
+> Steps: `tofu init` → `tofu plan` → post the plan output as a PR comment
 > This is for visibility and review — it does not block the merge.
 > The comment lets you see exactly what Terraform will change before it runs.
 > Reference: https://developer.hashicorp.com/terraform/tutorials/automation/github-actions
@@ -832,9 +835,9 @@ These tools are only needed on your developer machine for the one-time bootstrap
 >
 > 1. Checkout repo
 > 2. Write Ansible SSH private key from secret to `~/.ssh/ansible_key`
-> 3. `terraform init` + `terraform apply` — creates all 3 control plane VMs (pve1, pve2, pve3) + first worker VM on the best-capacity node (all with static IPs from cloud-init)
+> 3. `tofu init` + `tofu apply` — creates all 3 control plane VMs (pve1, pve2, pve3) + first worker VM on the best-capacity node (all with static IPs from cloud-init)
 > 4. Wait for VMs to finish cloud-init and become SSH-reachable (poll with ssh until ready)
-> 5. Generate Ansible inventory from `terraform output -json` using `jq` → writes `ansible/inventory/hosts.ini` with `[controlplane_primary]`, `[controlplane_secondary]`, and `[workers]` groups
+> 5. Generate Ansible inventory from `tofu output -json` using `jq` → writes `ansible/inventory/hosts.ini` with `[controlplane_primary]`, `[controlplane_secondary]`, and `[workers]` groups
 > 6. Run Ansible roles in order against the inventory:
 >    - `common` + `containerd` + `kubeadm` → all nodes
 >    - `keepalived` → all 3 CP nodes (VIP comes up before kubeadm runs)
@@ -946,8 +949,8 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > 3. Query Proxmox API per node, count workers by name pattern
 > 4. Calculate remaining capacity, select best node; if all full → send Discord "🚨 @here at capacity" → enter `manual-review` environment gate → on approval update `node_capacities.json` or cancel
 > 5. Derive new worker name (`worker-{node}-{next_seq}`)
-> 6. `terraform init` + `terraform apply` with new worker added to map
-> 7. Generate inventory for new VM IP from `terraform output`
+> 6. `tofu init` + `tofu apply` with new worker added to map
+> 7. Generate inventory for new VM IP from `tofu output`
 > 8. Run Ansible `site.yml` targeting new VM only
 > 9. Poll `kubectl get nodes` until new node is `Ready` (5-minute timeout; on timeout → send Discord failure + fail workflow)
 > 10. Send Discord: "✅ Worker {name} joined cluster on {node}"
@@ -961,7 +964,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > 3. Count current workers — if only 1 remains → send Discord "⚠️ Scale-in blocked — last worker" → enter `manual-review` gate
 > 4. `kubectl drain {node} --ignore-daemonsets --delete-emptydir-data`
 > 5. `kubectl delete node {node}`
-> 6. Remove worker entry from workers map, `terraform apply` → VM destroyed on Proxmox
+> 6. Remove worker entry from workers map, `tofu apply` → VM destroyed on Proxmox
 > 7. Verify node absent from `kubectl get nodes`
 > 8. Send Discord: "✅ Worker {name} removed — cluster at {remaining} workers"
 > Prometheus HTTP API: https://prometheus.io/docs/prometheus/latest/querying/api/
@@ -972,17 +975,17 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Steps:
 > 1. Read `client_payload.node` and `client_payload.metric` from the dispatch payload
 > 2. Send Discord: "⏳ Resource pressure ({metric}) on {node} — checking current allocation"
-> 3. Read current RAM and CPU cores for target VM from `terraform show -json`
+> 3. Read current RAM and CPU cores for target VM from `tofu show -json`
 > 4. **Decision gate by metric:**
 >    - **metric = memory:**
->      - If current RAM < 16 GB: send Discord "⏳ Vertically scaling {name}: {old}GB RAM → {new}GB"; cordon → drain → terraform apply (+4 GB) → wait for Ready → uncordon → send Discord "✅ Memory resize complete"
+>      - If current RAM < 16 GB: send Discord "⏳ Vertically scaling {name}: {old}GB RAM → {new}GB"; cordon → drain → tofu apply (+4 GB) → wait for Ready → uncordon → send Discord "✅ Memory resize complete"
 >      - If current RAM >= 16 GB: send Discord "ℹ️ {name} at RAM cap (16 GB) — triggering horizontal scale-out"; fire `scale-out` repository_dispatch → exit
 >    - **metric = cpu:**
->      - If current cores < 8: send Discord "⏳ Vertically scaling {name}: {old} cores → {new} cores"; cordon → drain → terraform apply (+2 cores) → wait for Ready → uncordon → send Discord "✅ CPU resize complete"
+>      - If current cores < 8: send Discord "⏳ Vertically scaling {name}: {old} cores → {new} cores"; cordon → drain → tofu apply (+2 cores) → wait for Ready → uncordon → send Discord "✅ CPU resize complete"
 >      - If current cores >= 8: send Discord "ℹ️ {name} at CPU cap (8 cores) — triggering horizontal scale-out"; fire `scale-out` repository_dispatch → exit
 >    - **metric = disk:**
 >      - Disk pressure always triggers horizontal scale-out (VMs cannot be vertically resized for disk without unmounting); send Discord "ℹ️ Disk pressure on {name} — triggering horizontal scale-out"; fire `scale-out` repository_dispatch → exit
-> `terraform show` docs: https://developer.hashicorp.com/terraform/cli/commands/show
+> `tofu show` docs: https://opentofu.org/docs/cli/commands/show/
 
 ---
 
@@ -1055,12 +1058,14 @@ These tools are only needed on your developer machine for the one-time bootstrap
 | Packer proxmox plugin overview | https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox |
 | Packer proxmox-iso builder | https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox/latest/components/builder/iso |
 | Packer proxmox-clone builder | https://developer.hashicorp.com/packer/integrations/hashicorp/proxmox/latest/components/builder/clone |
-| Packer Ubuntu preseed (unattended install) | https://developer.hashicorp.com/packer/guides/automatic-operating-system-installs/preseed_ubuntu |
+| Ubuntu autoinstall (unattended install) | https://ubuntu.com/server/docs/install/autoinstall |
 | bpg/proxmox provider | https://registry.terraform.io/providers/bpg/proxmox/latest/docs |
 | bpg/proxmox VM data source | https://registry.terraform.io/providers/bpg/proxmox/latest/docs/data-sources/virtual_environment_vms |
-| Terraform for_each | https://developer.hashicorp.com/terraform/language/meta-arguments/for_each |
+| OpenTofu for_each | https://opentofu.org/docs/language/meta-arguments/for_each/ |
+| OpenTofu tofu login | https://opentofu.org/docs/cli/commands/login/ |
+| OpenTofu tofu show | https://opentofu.org/docs/cli/commands/show/ |
 | Terraform Cloud workspaces | https://developer.hashicorp.com/terraform/cloud-docs/workspaces/creating |
-| Terraform GitHub Actions | https://developer.hashicorp.com/terraform/tutorials/automation/github-actions |
+| Terraform GitHub Actions (workflow reference) | https://developer.hashicorp.com/terraform/tutorials/automation/github-actions |
 | GitHub self-hosted runners | https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners |
 | GitHub Environments (approval gates) | https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment |
 | GitHub repository_dispatch | https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event |
