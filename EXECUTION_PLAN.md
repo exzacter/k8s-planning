@@ -290,6 +290,8 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > | Workers — pve3 (max 4) | 4 | 192.168.1.120–123 |
 > | Workers — pve4 (max 2) | 2 | 192.168.1.130–131 |
 > | Self-hosted runner VM | 1 | 192.168.1.50 |
+> | MinIO VM (OpenTofu state + Velero backups) | 1 | 192.168.1.60 |
+> | OpenBao VM (secrets management) | 1 | 192.168.1.61 |
 > | MetalLB pool (LoadBalancer Services) | 20 | 192.168.1.200–219 |
 >
 > The per-node worker ranges will be codified in `terraform/node_capacities.json` in Phase 5a.
@@ -302,16 +304,34 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > A successful JSON response confirms auth before any Terraform is written.
 > API reference: https://pve.proxmox.com/pve-docs/api-viewer/
 
+**Step 1.8 — Deploy MinIO on Proxmox and configure Backblaze B2**
+> These must exist before Phase 2 (OpenTofu state backend) and before the bootstrap workflow (Velero). Set them up now while you are doing Proxmox preparation.
+>
+> **MinIO (local — copy 2 of 3 for 3-2-1):**
+> MinIO is not a Kubernetes workload — run it as a standalone VM on Proxmox so it survives cluster rebuilds.
+> 1. Clone the Packer template to create a small Proxmox VM (2 CPU, 4 GB RAM, 100 GB disk)
+> 2. Assign static IP `192.168.1.60` (reserved in Step 1.6) and exclude it from DHCP
+> 3. Install MinIO: https://min.io/docs/minio/linux/index.html
+> 4. Create two buckets: `tfstate` (OpenTofu state) and `velero` (Velero backups + etcd snapshots)
+> 5. Create a MinIO access key and secret key with read/write access to both buckets — note both values
+>
+> **Backblaze B2 (offsite — copy 3 of 3 for 3-2-1):**
+> 1. Sign up at https://www.backblaze.com/sign-up/cloud-storage — free tier includes 10 GB; beyond that ~$6/TB/month
+> 2. Create a private bucket named `k8s-velero-offsite`
+> 3. Create an application key scoped to that bucket only — note the `keyID` and `applicationKey`
+> 4. Note your bucket's region from the B2 UI — the S3 endpoint format is `https://s3.<region>.backblazeb2.com`
+> 5. Store both in KeePassXC for now — they go into OpenBao in Step 7d.3 once OpenBao exists
+
 ---
 
 ## Phase 2: OpenTofu State Backend (MinIO S3)
 
-> OpenTofu state is stored on the local MinIO VM (already deployed in Phase 11.0 for Velero). This eliminates any dependency on a third-party service — state never leaves your LAN.
+> OpenTofu state is stored on the MinIO VM deployed in Step 1.8. This eliminates any dependency on a third-party service — state never leaves your LAN.
 > OpenTofu's `s3` backend is a protocol, not a service — it works with any S3-compatible endpoint including MinIO.
 
-**Step 2.1 — Create the `tfstate` bucket in MinIO**
-> MinIO UI or CLI: `mc mb minio/tfstate`
-> This bucket already exists if you followed Step 11.0 — just confirm it is present before continuing.
+**Step 2.1 — Confirm the `tfstate` bucket exists in MinIO**
+> MinIO UI or CLI: `mc ls minio/` — the `tfstate` bucket should be listed from Step 1.8.
+> If it is missing: `mc mb minio/tfstate`
 
 **Step 2.2 — Configure the S3 backend in `terraform/versions.tf`**
 > ```hcl
@@ -930,23 +950,11 @@ These tools are only needed on your developer machine for the one-time bootstrap
 
 ## Phase 11: GitHub Actions Secrets
 
-**Step 11.0 — Deploy MinIO on Proxmox and configure Backblaze B2 (prerequisites for Velero)**
-> Both storage targets must exist before the bootstrap workflow runs — Velero (deployed by ArgoCD in Phase 9 step 12) immediately tries to connect to its configured storage locations.
->
-> **MinIO (local — copy 2 of 3):**
-> MinIO is not a Kubernetes workload — run it as a standalone VM on Proxmox (outside the k8s cluster) so it remains available during cluster rebuilds.
-> 1. Clone the Packer template to create a small Proxmox VM (2 CPU, 4 GB RAM, 100 GB disk)
-> 2. Assign a static IP outside the k8s IP ranges (e.g. `192.168.1.60`)
-> 3. Install MinIO: https://min.io/docs/minio/linux/index.html
-> 4. Create two buckets: `velero` (Velero backups + etcd snapshots) and `tfstate` (OpenTofu state)
-> 5. Create a MinIO access key and secret key with read/write access to both buckets
->
-> **Backblaze B2 (offsite — copy 3 of 3):**
-> 1. Sign up at https://www.backblaze.com/sign-up/cloud-storage — free tier includes 10 GB; beyond that ~$6/TB/month
-> 2. Create a bucket named `k8s-velero-offsite` (set to private)
-> 3. Create an application key with read/write access to that bucket only — note the `keyID` and `applicationKey`
-> 4. B2 S3-compatible endpoint format: `https://s3.<region>.backblazeb2.com` — find your bucket's region in the B2 UI
-> 5. Store `keyID` as `B2_ACCESS_KEY` and `applicationKey` as `B2_SECRET_KEY` in OpenBao (`bao kv put secret/backblaze access_key=<keyID> secret_key=<applicationKey>`)
+**Step 11.0 — Confirm MinIO and Backblaze B2 are ready**
+> Both were set up in Step 1.8 — nothing to do here if you followed Phase 1 in order.
+> Quick sanity check before the bootstrap workflow runs:
+> - MinIO: `mc ls minio/` should show both `tfstate` and `velero` buckets
+> - B2: credentials are in KeePassXC (they get loaded into OpenBao in Step 7d.3, which runs before this phase)
 
 **Step 11.1 — Store all secrets in GitHub Actions**
 > GitHub repo → Settings → Secrets and variables → Actions.
