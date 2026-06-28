@@ -75,7 +75,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 
 **Step 0.2 — Generate the Ansible SSH key pair**
 > `ssh-keygen -t ed25519 -f ~/.ssh/k8s_ansible` — or let install-tools.sh prompt for this.
-> The public key goes into every VM via cloud-init (Terraform `initialization` block).
+> The public key goes into every VM via cloud-init (OpenTofu `initialization` block).
 > The private key gets stored as `ANSIBLE_SSH_PRIVATE_KEY` in GitHub Actions Secrets.
 
 ---
@@ -103,8 +103,8 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Packer does NOT need VM.Clone — it builds from ISO, not from an existing template.
 >
 > Then create an API token for `packer@pve` (same UI path as Step 1.2). Store the Token ID and Secret immediately.
-> Export as environment variables before running `packer build`:
-> `PROXMOX_TOKEN_ID`, `PROXMOX_TOKEN_SECRET` — reference these in the Packer HCL via `var.proxmox_token_id` etc.
+> Export as environment variables before running `packer build` — Packer picks up `PKR_VAR_*` variables automatically:
+> `PKR_VAR_proxmox_api_token_id`, `PKR_VAR_proxmox_api_token_secret` — these map to `var.proxmox_api_token_id` and `var.proxmox_api_token_secret` in the HCL.
 > Also store both as GitHub Actions secrets (`PACKER_TOKEN_ID`, `PACKER_TOKEN_SECRET`) for any future CI builds.
 > Docs: https://pve.proxmox.com/wiki/User_Management
 
@@ -162,21 +162,21 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Note: the builder type is `proxmox-iso`, not `proxmox` — the old `proxmox` builder name is deprecated and will produce a warning.
 >
 > **File 2: `packer/http/user-data`**
-> The Ubuntu autoinstall config. This is a YAML file (not HCL) that the Ubuntu 24.04 installer fetches over HTTP from Packer's built-in HTTP server during the boot process. It replaces the old preseed approach used in Ubuntu 20.04 and earlier.
-> It defines: locale, keyboard, network (DHCP during install), storage layout, and crucially — the user account that gets created on the VM.
+> The Ubuntu autoinstall config. This is a YAML file (not HCL) that the Ubuntu 24.04 installer reads from a **cidata CD-ROM** — NOT from Packer's HTTP server. Packer bundles `user-data` and `meta-data` into an ISO image (using the `cd_files` option in `additional_iso_files`) and attaches it to the VM as a CD-ROM drive labelled `cidata`. The installer reads it directly from that drive.
+> It defines: locale, keyboard, network (DHCP during install), storage layout, and the user account that gets created on the VM.
 > The username and password you define here must match `ssh_username` and `ssh_password` in your `.pkr.hcl`, because Packer uses those credentials to SSH in after install and run the provisioner.
-> This is a template-only credential — it exists only so Packer can connect. Terraform/cloud-init replaces user config on each cloned VM at deploy time.
+> This is a template-only credential — it exists only so Packer can connect. OpenTofu/cloud-init replaces user config on each cloned VM at deploy time.
 > Ubuntu autoinstall reference: https://ubuntu.com/server/docs/install/autoinstall-reference
 > Ubuntu autoinstall schema (full field list): https://ubuntu.com/server/docs/install/autoinstall-schema
 >
 > **File 3: `packer/http/meta-data`**
-> An empty file. Ubuntu's cloud-init/autoinstall requires both `user-data` and `meta-data` to be present at the same URL path, even if `meta-data` contains nothing. Packer serves both files from its HTTP server. If this file is missing the installer will stall waiting for it.
+> A near-empty file containing only `instance-id: packer-build`. Ubuntu's cloud-init/autoinstall requires both `user-data` and `meta-data` to be present on the cidata drive, even if `meta-data` is minimal. If this file is missing the installer will stall.
 >
 > **Summary of the relationship:**
 > ```
-> .pkr.hcl boot_command → tells Ubuntu installer: "fetch autoinstall config from http://<packer-ip>:<port>/"
-> Ubuntu installer → fetches http/user-data (installs OS using those settings, creates the user)
-> Ubuntu installer → fetches http/meta-data (must exist, can be empty)
+> .pkr.hcl boot_command → injects "autoinstall ds=nocloud" into GRUB kernel cmdline
+> Ubuntu installer → reads user-data from cidata CD-ROM (not HTTP)
+> Ubuntu installer → reads meta-data from cidata CD-ROM
 > Packer SSH communicator → connects using ssh_username/ssh_password (must match what user-data created)
 > build {} provisioner → runs shell commands on the now-running VM
 > Packer → converts VM to template
@@ -187,8 +187,8 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > packer/
 >   ubuntu-2404.pkr.hcl
 >   http/
->     user-data
->     meta-data
+>     user-data    ← bundled into cidata ISO via cd_files, NOT served over HTTP
+>     meta-data    ← same
 > ```
 >
 > Good community examples of this exact structure for Proxmox + Ubuntu 24.04:
@@ -215,12 +215,11 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > 1. Wait for GRUB to appear (`<wait>` entries give it time)
 > 2. Press `e` to open the selected boot entry for editing
 > 3. Navigate to the end of the `linux` kernel line
-> 4. Append `autoinstall ds=nocloud-net;s=http://{{ .HTTPIP }}:{{ .HTTPPort }}/` to the kernel parameters
+> 4. Append `autoinstall ds=nocloud` to the kernel parameters (before the trailing ` ---`)
 > 5. Press `F10` or `ctrl+x` to boot with the modified parameters
 >
-> `{{ .HTTPIP }}` and `{{ .HTTPPort }}` are Packer template variables resolved at build time to the IP and port of Packer's built-in HTTP server running on your machine.
->
-> `ds=nocloud-net;s=http://...` tells Ubuntu's cloud-init datasource where to fetch `user-data` and `meta-data`.
+> `ds=nocloud` tells Ubuntu's cloud-init to look for `user-data` and `meta-data` on a locally attached drive (the cidata CD-ROM). Do NOT use `ds=nocloud-net` (which points at an HTTP server) — this build uses a cidata ISO attached via `additional_iso_files`, not Packer's HTTP server.
+> The `autoinstall` keyword in the cmdline is required to skip the "Continue with autoinstall?" confirmation prompt that Ubuntu shows when it detects an autoinstall config.
 >
 > The exact boot_command for Ubuntu 24.04 differs from 20.04 — use a 24.04-specific example as reference rather than adapting a 20.04 one. The rkoosaar repo targets 20.04; its boot_command will not work without modification.
 > Search GitHub for `packer proxmox ubuntu 24.04` to find current examples with the correct boot_command sequence.
@@ -389,8 +388,6 @@ These tools are only needed on your developer machine for the one-time bootstrap
 >     key                         = "k8s-proxmox/terraform.tfstate"
 >     region                      = "us-east-1"        # required by the S3 protocol; MinIO ignores it
 >     endpoint                    = "http://192.168.1.60:9000"
->     access_key                  = var.minio_access_key
->     secret_key                  = var.minio_secret_key
 >     skip_credentials_validation = true
 >     skip_metadata_api_check     = true
 >     skip_region_validation      = true
@@ -403,7 +400,13 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Docs: https://opentofu.org/docs/language/settings/backends/s3/
 
 **Step 2.3 — Initialise the backend from your developer machine**
-> `tofu init` — OpenTofu connects to MinIO, creates the state file in the `tfstate` bucket, and confirms the lock mechanism works.
+> OpenTofu backend blocks cannot use `var.*` references — credentials must be passed as environment variables before running `tofu init`:
+> ```
+> export AWS_ACCESS_KEY_ID=<minio-access-key>
+> export AWS_SECRET_ACCESS_KEY=<minio-secret-key>
+> ```
+> Then run `tofu init` — OpenTofu connects to MinIO, creates the state file in the `tfstate` bucket, and confirms the lock mechanism works.
+> These same env vars must be set in every GitHub Actions workflow that runs `tofu` commands — add them as GitHub Secrets (`MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`) and expose them in each workflow's `env:` block.
 > MinIO must be reachable from your developer machine — if you are not on the LAN, use a VPN or SSH tunnel to `192.168.1.60:9000` first.
 
 ---
@@ -434,7 +437,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > After this, the runner has everything it needs to execute any workflow.
 
 **Step 3.4 — Place the Ansible SSH private key on the runner**
-> The runner needs the private key from Step 0.5 to SSH into k8s VMs during Ansible runs.
+> The runner needs the private key from Step 0.2 to SSH into k8s VMs during Ansible runs.
 > Copy it to `~/.ssh/ansible_key` on the runner VM and set permissions to 600.
 > This same key is stored as a GitHub Secret — the bootstrap workflow writes it to this path at runtime.
 
@@ -509,7 +512,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 >   "pve4": { "max_workers": 2, "worker_ip_start": "192.168.1.130", "worker_ip_end": "192.168.1.131" }
 > }
 > ```
-> All IPs in these ranges must also be in the DHCP exclusion list you configured in Step 1.5 — otherwise your router may hand them to other devices.
+> All IPs in these ranges must also be in the DHCP exclusion list you configured in Step 1.6 — otherwise your router may hand them to other devices.
 > Changing a node's capacity or IP range is a Git commit — fully auditable.
 > The deploy-worker workflow reads this file to determine placement AND to select the next available IP for the new VM.
 
@@ -562,7 +565,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Trigger: pull request that modifies any file under `terraform/`
 > Steps: `tofu init` → `tofu plan` → post the plan output as a PR comment
 > This is for visibility and review — it does not block the merge.
-> The comment lets you see exactly what Terraform will change before it runs.
+> The comment lets you see exactly what OpenTofu will change before it runs.
 > Reference: https://developer.hashicorp.com/terraform/tutorials/automation/github-actions
 >
 > **After writing this workflow and pushing it, return to Step 4.5 and complete the branch protection setup:**
@@ -577,7 +580,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 **Step 6.1 — Write `ansible/group_vars/` variable files**
 > Three files, all committed to Git:
 > - `all.yml` — shared variables for every node: Kubernetes version (e.g. `1.30`), pod CIDR (`192.168.0.0/16`), SSH user (`ubuntu`), SSH key path, LAN gateway, DNS server
-> - `controlplane.yml` — control plane–specific variables: `keepalived_vip` (the VIP address from Step 1.5), `kubeadm_cert_key` (populated at runtime by bootstrap workflow), primary CP node name (`controlplane-pve1`)
+> - `controlplane.yml` — control plane–specific variables: `keepalived_vip` (the VIP address from Step 1.6), `kubeadm_cert_key` (populated at runtime by bootstrap workflow), primary CP node name (`controlplane-pve1`)
 > - `workers.yml` — worker-specific variables: any worker-only settings (e.g. kubelet resource reservations)
 
 **Step 6.2 — Write the `common` role**
@@ -656,7 +659,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 
 **Step 7.1 — Write MetalLB manifests in `k8s/ingress/`**
 > An ArgoCD `Application` pointing to the MetalLB Helm chart.
-> A `ConfigMap` with the `IPAddressPool` and `L2Advertisement` custom resources using the IPs from Step 1.5.
+> A `ConfigMap` with the `IPAddressPool` and `L2Advertisement` custom resources using the IPs from Step 1.6.
 > Reference: https://metallb.universe.tf/installation/
 
 **Step 7.2 — Write ingress-nginx manifest in `k8s/ingress/`**
@@ -691,7 +694,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > An ArgoCD `Application` pointing to the Velero Helm chart deployed to the `velero` namespace.
 > Configure **two** `BackupStorageLocation` resources — this is what gives you 3-2-1:
 > - `local` (default): MinIO on Proxmox (`http://192.168.1.60:9000`) — fast local restore, same site
-> - `offsite`: Backblaze B2 — S3-compatible endpoint (`https://s3.us-west-004.backblazeb2.com`), different physical location
+> - `offsite`: Backblaze B2 — S3-compatible endpoint (`https://s3.<your-region>.backblazeb2.com` — find your region in the B2 UI), different physical location
 >
 > Both locations receive every backup. Velero supports multiple storage locations natively — set `default: true` on the MinIO location so restores default to local (faster), with B2 available as the DR target.
 > A `Schedule` CRD triggers a daily full backup at 02:00 with 7-day retention, writing to both locations.
@@ -723,10 +726,13 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Create on **pve2** — which runs a secondary control plane VM but no other infrastructure VMs. A pve2 failure loses a secondary CP (keepalived VIP handles this) and takes OpenBao offline, but existing secrets already synced into k8s Secrets by ESO remain cached in the cluster. MinIO (pve4) and the runner (pve3) are unaffected.
 > Clone the Packer template on pve2: 2 CPU, 2 GB RAM, 20 GB disk.
 > Assign static IP `192.168.1.61` (reserved in Step 1.6).
-> SSH in and install OpenBao:
+> SSH in and install OpenBao from GitHub releases (Ubuntu 24.04):
 > ```
-> curl -fsSL https://apt.releases.opentofu.org/gpg | sudo gpg --dearmor -o /usr/share/keyrings/opentofu.gpg
-> # Use OpenBao release from https://openbao.org/docs/install/
+> # Find latest release at https://github.com/openbao/openbao/releases
+> BAO_VERSION=2.0.0   # replace with latest
+> wget "https://github.com/openbao/openbao/releases/download/v${BAO_VERSION}/bao_${BAO_VERSION}_linux_amd64.deb"
+> sudo dpkg -i "bao_${BAO_VERSION}_linux_amd64.deb"
+> sudo systemctl enable --now bao
 > ```
 > Reference: https://openbao.org/docs/install/
 
@@ -835,7 +841,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 
 **Step 8.2 — Create a Discord webhook for that channel**
 > Channel Settings → Integrations → Webhooks → New Webhook → Copy URL.
-> Store the URL as a GitHub Secret: `DISCORD_WEBHOOK_URL`.
+> Store the URL as a GitHub Secret: `DISCORD_WEBHOOK_URL`. It must remain a GitHub Secret (not only in OpenBao) because the bootstrap workflow (Phase 9 step 15) sends a Discord notification before the cluster exists and ESO is running. Post-bootstrap, it also goes into OpenBao (`bao kv put secret/discord webhook_url=<url>`) so ArgoCD Notifications and the webhook adapter can access it via ESO without reading GitHub Secrets.
 > Discord webhook reference: https://discord.com/developers/docs/resources/webhook#execute-webhook
 
 **Step 8.3 — Define the notification events**
@@ -921,6 +927,8 @@ These tools are only needed on your developer machine for the one-time bootstrap
 
 ## Phase 9: Bootstrap Workflow (one-time cluster creation)
 
+> **Prerequisite: Phase 11 (GitHub Actions Secrets) must be completed before triggering this workflow.** The workflow reads `PROXMOX_API_TOKEN_ID/SECRET`, `ANSIBLE_SSH_PRIVATE_KEY`, `OPENBAO_ADDR`, `OPENBAO_TOKEN`, `MINIO_ACCESS_KEY`, and `MINIO_SECRET_KEY` from GitHub Secrets on its first step. If those secrets don't exist the workflow fails immediately.
+>
 > This is the single manually-triggered workflow that creates everything from scratch.
 > After this workflow succeeds, the cluster is running and all subsequent operations are automated.
 
@@ -1001,6 +1009,8 @@ These tools are only needed on your developer machine for the one-time bootstrap
 
 ## Phase 11: GitHub Actions Secrets
 
+> **Complete this phase before Phase 9 (Bootstrap Workflow).** Despite the phase number, the GitHub Secrets set up here are required by the bootstrap workflow. Do Phase 11 immediately after Phase 7d (OpenBao), since `OPENBAO_ADDR` and `OPENBAO_TOKEN` come from that step.
+
 **Step 11.0 — Confirm MinIO and Backblaze B2 are ready**
 > Both were set up in Step 1.8 — nothing to do here if you followed Phase 1 in order.
 > Quick sanity check before the bootstrap workflow runs:
@@ -1017,6 +1027,9 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > - `GH_DISPATCH_TOKEN` — GitHub PAT with `workflow` scope (for webhook adapter + scaling workflows)
 > - `OPENBAO_ADDR` — OpenBao server address (e.g. `http://192.168.1.61:8200`)
 > - `OPENBAO_TOKEN` — OpenBao token for bootstrap workflow to read secrets during cluster init
+> - `MINIO_ACCESS_KEY` — MinIO access key (used as `AWS_ACCESS_KEY_ID` env var for `tofu` commands)
+> - `MINIO_SECRET_KEY` — MinIO secret key (used as `AWS_SECRET_ACCESS_KEY` env var for `tofu` commands)
+> - `DISCORD_WEBHOOK_URL` — Discord webhook URL (needed for bootstrap step 15 before ESO exists)
 > Note: `KUBECONFIG_B64` is written automatically by the bootstrap workflow (Step 9.1 step 14).
 > Discord webhook URL, MinIO credentials, and all other runtime secrets are loaded into OpenBao (Step 7d.3) and synced into k8s Secrets by ESO post-bootstrap.
 
@@ -1096,10 +1109,10 @@ These tools are only needed on your developer machine for the one-time bootstrap
 **Step 13.2 — Test resize (memory)**
 > Run `stress-ng --vm 1 --vm-bytes 80%` on ONE worker.
 > Observe: `NodeMemoryPressure` alert → `resize-worker` workflow (metric=memory) → cordon/drain/resize/rejoin → Discord notifications at each stage.
-> Verify the new RAM value in `terraform show`.
+> Verify the new RAM value in `tofu show`.
 
 **Step 13.3 — Test the 16 GB cap → horizontal trigger**
-> Manually update the workers map in Terraform to set one worker to 16 GB, apply.
+> Manually update the workers map in OpenTofu to set one worker to 16 GB, apply.
 > Stress that worker. Confirm `resize-worker` detects the RAM cap and triggers `deploy-worker` instead.
 > Discord should show both the "cap hit" notification and the subsequent scale-out notification.
 > Also test CPU cap: set a worker to 8 cores, run `stress-ng --cpu 8`, confirm same horizontal fallback.
@@ -1107,7 +1120,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 **Step 13.4 — Test scale-in**
 > Let workers idle. After 15 minutes, `NodeUnderutilised` fires (RAM < 30% AND CPU < 20%).
 > Observe: `remove-worker` workflow → dual metric re-check → drain → destroy → Discord success notification.
-> Confirm `terraform show` no longer lists the removed VM.
+> Confirm `tofu show` no longer lists the removed VM.
 
 **Step 13.5 — Test approval gate (capacity full)**
 > Temporarily lower `node_capacities.json` to make all nodes appear full.
