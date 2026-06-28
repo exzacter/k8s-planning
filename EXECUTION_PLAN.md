@@ -11,7 +11,7 @@ Follow phases in order; each phase has hard dependencies on the one before it.
 These cannot be automated because they are either initial credentials that must exist before automation can run, or human decisions with no computable answer:
 
 - Creating the Proxmox API user and token (chicken-and-egg — the token is what automation uses)
-- Deciding IP ranges (Step 1.5 — your router/LAN layout)
+- Deciding IP ranges (Step 1.6 — your router/LAN layout)
 - Creating the Backblaze B2 account and bucket (web signup — offsite backup target)
 - Registering the GitHub Actions runner (GitHub generates the token in the UI)
 - Populating GitHub Secrets (you cannot script secret injection)
@@ -82,7 +82,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 
 ## Phase 1: Proxmox Preparation
 
-**Step 1.1 — Create a dedicated Proxmox user for Terraform**
+**Step 1.1 — Create a dedicated Proxmox user for OpenTofu**
 > Do not use root. Create `terraform@pve` with minimum required roles:
 > VM.Allocate, VM.Clone, VM.Config.*, Datastore.AllocateSpace, SDN.Use.
 > Docs: https://pve.proxmox.com/wiki/User_Management
@@ -109,7 +109,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Docs: https://pve.proxmox.com/wiki/User_Management
 
 **Step 1.4 — Understand what you are building before writing any Packer config**
-> A Proxmox VM template is a locked, non-bootable VM image that Terraform clones for every k8s node. You do not touch it after creation — Terraform and cloud-init handle all per-VM configuration at clone time.
+> A Proxmox VM template is a locked, non-bootable VM image that OpenTofu clones for every k8s node. You do not touch it after creation — Terraform and cloud-init handle all per-VM configuration at clone time.
 > Read these two Proxmox docs before writing anything:
 > 1. What a VM template is and how it is created from a VM: https://pve.proxmox.com/wiki/VM_Templates_and_Clones
 > 2. How Proxmox cloud-init works and why the template must include a cloud-init drive: https://pve.proxmox.com/wiki/Cloud-Init_Support
@@ -225,7 +225,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Search GitHub for `packer proxmox ubuntu 24.04` to find current examples with the correct boot_command sequence.
 
 **Step 1.4d — What the provisioner block does and what to put in it**
-> After the OS installs and Packer SSHes in, the `build {}` block runs provisioner commands on the live VM before converting it to a template. This is where you bake k8s prerequisites into the image so Terraform doesn't have to install them every time it clones a new node.
+> After the OS installs and Packer SSHes in, the `build {}` block runs provisioner commands on the live VM before converting it to a template. This is where you bake k8s prerequisites into the image so OpenTofu doesn't have to install them every time it clones a new node.
 >
 > What to install/configure in the provisioner for a k8s node template:
 > - `qemu-guest-agent` — required for Proxmox to report VM IP addresses and for clean shutdown signals
@@ -246,7 +246,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > ```
 > export PKR_VAR_proxmox_token_id="packer@pve!yourtoken"
 > export PKR_VAR_proxmox_token_secret="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-> export PKR_VAR_proxmox_node="pve1"
+> export PKR_VAR_proxmox_node="pve"
 > ```
 >
 > Then run:
@@ -263,7 +263,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > **Running on all 4 nodes (no shared storage):**
 > Because your Proxmox nodes don't share storage, each node needs its own local copy of the template. Run Packer once per node, changing only the target node each time:
 > ```
-> PKR_VAR_proxmox_node=pve1 packer build packer/ubuntu-2404.pkr.hcl
+> PKR_VAR_proxmox_node=pve packer build packer/ubuntu-2404.pkr.hcl
 > PKR_VAR_proxmox_node=pve2 packer build packer/ubuntu-2404.pkr.hcl
 > PKR_VAR_proxmox_node=pve3 packer build packer/ubuntu-2404.pkr.hcl
 > PKR_VAR_proxmox_node=pve4 packer build packer/ubuntu-2404.pkr.hcl
@@ -281,10 +281,10 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > | Purpose | Count | Example range |
 > |---|---|---|
 > | Control plane VIP (keepalived) | 1 | 192.168.1.9 |
-> | Control plane VM — pve1 | 1 | 192.168.1.10 |
+> | Control plane VM — pve | 1 | 192.168.1.10 |
 > | Control plane VM — pve2 | 1 | 192.168.1.11 |
 > | Control plane VM — pve3 | 1 | 192.168.1.12 |
-> | Workers — pve1 (max 3) | 3 | 192.168.1.100–102 |
+> | Workers — pve (max 3) | 3 | 192.168.1.100–102 |
 > | Workers — pve2 (max 6) | 6 | 192.168.1.110–115 |
 > | Workers — pve3 (max 4) | 4 | 192.168.1.120–123 |
 > | Workers — pve4 (max 2) | 2 | 192.168.1.130–131 |
@@ -297,7 +297,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 >
 > | Node | Kubernetes role | Infrastructure VM |
 > |---|---|---|
-> | pve1 | Primary control plane | — |
+> | pve | Primary control plane | — |
 > | pve2 | Secondary control plane | OpenBao (192.168.1.61) |
 > | pve3 | Secondary control plane | GitHub Actions runner (192.168.1.50) |
 > | pve4 | Workers only | MinIO (192.168.1.60) |
@@ -465,7 +465,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Provider version reference: https://registry.terraform.io/providers/bpg/proxmox/latest
 
 **Step 4.4 — Create `renovate.json` in the repo root**
-> Renovate Bot automatically opens PRs when new versions of Helm charts, Terraform providers, container images, or GitHub Actions are released.
+> Renovate Bot automatically opens PRs when new versions of Helm charts, OpenTofu providers, container images, or GitHub Actions are released.
 > The config file tells Renovate what to scan and how to group updates.
 > Minimal starting config:
 > ```json
@@ -485,7 +485,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > In GitHub: Settings → Branches → Add branch protection rule for `main`.
 > Enable:
 > - Require a pull request before merging (1 approval minimum)
-> - Require status checks to pass before merging — add `terraform-plan` as a required check (write the workflow in Phase 5.6 first, then come back and add the check name)
+> - Require status checks to pass before merging — add `tofu-plan` as a required check (write the workflow in Phase 5.6 first, then come back and add the check name)
 > - Require branches to be up to date before merging
 > - Do not allow force pushes
 > This ensures no infrastructure change can be merged without a passing Terraform plan and at least one review.
@@ -509,7 +509,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Example:
 > ```json
 > {
->   "pve1": { "max_workers": 3, "worker_ip_start": "192.168.1.100", "worker_ip_end": "192.168.1.102" },
+>   "pve": { "max_workers": 3, "worker_ip_start": "192.168.1.100", "worker_ip_end": "192.168.1.102" },
 >   "pve2": { "max_workers": 6, "worker_ip_start": "192.168.1.110", "worker_ip_end": "192.168.1.115" },
 >   "pve3": { "max_workers": 4, "worker_ip_start": "192.168.1.120", "worker_ip_end": "192.168.1.123" },
 >   "pve4": { "max_workers": 2, "worker_ip_start": "192.168.1.130", "worker_ip_end": "192.168.1.131" }
@@ -520,7 +520,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > The deploy-worker workflow reads this file to determine placement AND to select the next available IP for the new VM.
 
 **Step 5a.3 — Document the worker naming convention**
-> Pattern: `worker-{proxmox-node}-{zero-padded-sequence}` (e.g. `worker-pve2-01`, `worker-pve1-03`)
+> Pattern: `worker-{proxmox-node}-{zero-padded-sequence}` (e.g. `worker-pve2-01`, `worker-pve-03`)
 > The node name embedded in the VM name is what allows the placement algorithm to count workers per node
 > by filtering the Proxmox API response — no separate tracking database needed.
 
@@ -530,7 +530,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Variables needed: Proxmox API URL, token ID (sensitive), token secret (sensitive), template name, SSH public key, network bridge name, LAN gateway, LAN DNS server.
 >
 > Static IPs for control plane — defined as defaults in variables.tf, never change after first apply:
-> - `controlplane_ips` — map of CP node name → static IP (e.g. `{ "pve1": "192.168.1.10", "pve2": "192.168.1.11", "pve3": "192.168.1.12" }`)
+> - `controlplane_ips` — map of CP node name → static IP (e.g. `{ "pve": "192.168.1.10", "pve2": "192.168.1.11", "pve3": "192.168.1.12" }`)
 > - `controlplane_vip` — the keepalived virtual IP (e.g. `"192.168.1.9"`) — this is the address kubeadm and all workers use to reach the API server
 >
 > The workers variable is a **map of objects** — key = worker name, value = `{node, memory, cores, ip}`.
@@ -542,8 +542,8 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > Reference: https://registry.terraform.io/providers/bpg/proxmox/latest/docs#argument-reference
 
 **Step 5.3 — Write `terraform/controlplane.tf`**
-> Three `proxmox_virtual_environment_vm` resources using `for_each` over a map of `{controlplane-pve1, controlplane-pve2, controlplane-pve3}`.
-> Each VM targets its respective Proxmox node (pve1, pve2, pve3). pve4 receives no control plane VMs.
+> Three `proxmox_virtual_environment_vm` resources using `for_each` over a map of `{controlplane-pve, controlplane-pve2, controlplane-pve3}`.
+> Each VM targets its respective Proxmox node (pve, pve2, pve3). pve4 receives no control plane VMs.
 > Cloud-init per VM: hostname, SSH public key, static IP (from the three reserved CP IPs).
 > Also define a variable for the keepalived VIP address — this is passed into Ansible and used as the kubeadm `--control-plane-endpoint`.
 > Reference: https://registry.terraform.io/providers/bpg/proxmox/latest/docs/resources/virtual_environment_vm
@@ -563,16 +563,17 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > The CP IPs and VIP feed into Ansible inventory generation. The worker map feeds the remove-worker workflow so it knows which Proxmox node to destroy a given VM on.
 > The deploy-worker and remove-worker workflows both use `tofu show -json` to read current state rather than relying on output files, so state is always authoritative.
 
-**Step 5.6 — Create a CI workflow for `terraform plan` on pull requests**
-> File: `.github/workflows/terraform-plan.yml`
+**Step 5.6 — Create a CI workflow for `tofu plan` on pull requests**
+> File: `.github/workflows/tofu-plan.yml`
 > Trigger: pull request that modifies any file under `terraform/`
 > Steps: `tofu init` → `tofu plan` → post the plan output as a PR comment
 > This is for visibility and review — it does not block the merge.
 > The comment lets you see exactly what OpenTofu will change before it runs.
-> Reference: https://developer.hashicorp.com/terraform/tutorials/automation/github-actions
+> The workflow job must export MinIO credentials as env vars (`AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}`, `AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}`) so `tofu init` can reach the S3 backend.
+> Reference: https://opentofu.org/docs/intro/use-cases/
 >
 > **After writing this workflow and pushing it, return to Step 4.5 and complete the branch protection setup:**
-> The `terraform-plan` status check name only appears in the GitHub branch protection UI after the workflow has run at least once on a PR. Open a test PR against `main` touching any file in `terraform/`, let the workflow run, then go to Settings → Branches → edit the `main` protection rule and add `terraform-plan` as a required status check.
+> The `tofu-plan` status check name only appears in the GitHub branch protection UI after the workflow has run at least once on a PR. Open a test PR against `main` touching any file in `terraform/`, let the workflow run, then go to Settings → Branches → edit the `main` protection rule and add `tofu-plan` as a required status check.
 
 ---
 
@@ -583,7 +584,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 **Step 6.1 — Write `ansible/group_vars/` variable files**
 > Three files, all committed to Git:
 > - `all.yml` — shared variables for every node: Kubernetes version (e.g. `1.30`), pod CIDR (`192.168.0.0/16`), SSH user (`ubuntu`), SSH key path, LAN gateway, DNS server
-> - `controlplane.yml` — control plane–specific variables: `keepalived_vip` (the VIP address from Step 1.6), `kubeadm_cert_key` (populated at runtime by bootstrap workflow), primary CP node name (`controlplane-pve1`)
+> - `controlplane.yml` — control plane–specific variables: `keepalived_vip` (the VIP address from Step 1.6), `kubeadm_cert_key` (populated at runtime by bootstrap workflow), primary CP node name (`controlplane-pve`)
 > - `workers.yml` — worker-specific variables: any worker-only settings (e.g. kubelet resource reservations)
 
 **Step 6.2 — Write the `common` role**
@@ -635,7 +636,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > The package name is `keepalived` on all major distros — install via the appropriate package manager. The `/etc/keepalived/keepalived.conf` config format is identical across distros.
 > Reference: https://keepalived.readthedocs.io/en/latest/configuration_synopsis.html
 
-**Step 6.6 — Write the `controlplane` role (primary node only — pve1)**
+**Step 6.6 — Write the `controlplane` role (primary node only — pve)**
 > Runs `kubeadm init --control-plane-endpoint <VIP>:6443 --upload-certs --pod-network-cidr=192.168.0.0/16`.
 > `--upload-certs` uploads the cluster CA to etcd so secondary CP nodes can retrieve them during join (avoids manual cert copying).
 > Copies `admin.conf` to the ubuntu home directory.
@@ -939,17 +940,23 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > File: `.github/workflows/bootstrap.yml`
 > Trigger: `workflow_dispatch` (manually triggered once — this is the one acceptable manual trigger)
 > Runs on: self-hosted runner (Phase 3)
+> The workflow job must expose MinIO credentials as env vars so every `tofu` command can reach the S3 backend:
+> ```yaml
+> env:
+>   AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
+>   AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+> ```
 > Steps in order:
 >
 > 1. Checkout repo
 > 2. Write Ansible SSH private key from secret to `~/.ssh/ansible_key`
-> 3. `tofu init` + `tofu apply` — creates all 3 control plane VMs (pve1, pve2, pve3) + first worker VM on the best-capacity node (all with static IPs from cloud-init)
+> 3. `tofu init` + `tofu apply` — creates all 3 control plane VMs (pve, pve2, pve3) + first worker VM on the best-capacity node (all with static IPs from cloud-init)
 > 4. Wait for VMs to finish cloud-init and become SSH-reachable (poll with ssh until ready)
 > 5. Generate Ansible inventory from `tofu output -json` using `jq` → writes `ansible/inventory/hosts.ini` with `[controlplane_primary]`, `[controlplane_secondary]`, and `[workers]` groups
 > 6. Run Ansible roles in order against the inventory:
 >    - `common` + `containerd` + `kubeadm` → all nodes
 >    - `keepalived` → all 3 CP nodes (VIP comes up before kubeadm runs)
->    - `controlplane` → primary CP node (pve1) — `kubeadm init --control-plane-endpoint <VIP>:6443 --upload-certs --pod-network-cidr=192.168.0.0/16`
+>    - `controlplane` → primary CP node (pve) — `kubeadm init --control-plane-endpoint <VIP>:6443 --upload-certs --pod-network-cidr=192.168.0.0/16`
 >    - `controlplane-join` → secondary CP nodes (pve2, pve3) sequentially — `kubeadm join --control-plane`
 >    - `worker` → first worker node — `kubeadm join <VIP>:6443`
 > 7. Apply Calico CNI manifests via kubectl (pod CIDR must match `192.168.0.0/16`)
@@ -1049,6 +1056,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 **Step 12.1 — Write `deploy-worker` workflow**
 > File: `.github/workflows/deploy-worker.yml`
 > Trigger: `repository_dispatch` type `scale-out`
+> The workflow job must expose MinIO credentials as env vars (`AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}`, `AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}`) so `tofu init`/`tofu apply` can reach the S3 backend.
 > Steps:
 > 1. Send Discord: "⏳ Scale-out triggered — selecting placement node"
 > 2. Read `terraform/node_capacities.json`
@@ -1064,6 +1072,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 **Step 12.2 — Write `remove-worker` workflow**
 > File: `.github/workflows/remove-worker.yml`
 > Trigger: `repository_dispatch` type `scale-in`
+> The workflow job must expose MinIO credentials as env vars (`AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}`, `AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}`) so `tofu apply` can reach the S3 backend.
 > Steps:
 > 1. Send Discord: "⏳ Scale-in triggered for {node}"
 > 2. Re-query Prometheus API — confirm BOTH RAM < 30% AND CPU < 20% still hold (matching the `NodeUnderutilised` dual condition); if either has recovered → send Discord "ℹ️ Scale-in cancelled — node recovered" → exit cleanly
@@ -1078,6 +1087,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 **Step 12.3 — Write `resize-worker` workflow**
 > File: `.github/workflows/resize-worker.yml`
 > Trigger: `repository_dispatch` type `resource-pressure` (carries `client_payload.metric`: `memory` | `cpu` | `disk`)
+> The workflow job must expose MinIO credentials as env vars (`AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}`, `AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}`) so `tofu apply` can reach the S3 backend.
 > Steps:
 > 1. Read `client_payload.node` and `client_payload.metric` from the dispatch payload
 > 2. Send Discord: "⏳ Resource pressure ({metric}) on {node} — checking current allocation"
@@ -1151,7 +1161,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 
 **Step 13.8 — Verify pve-exporter metrics in Grafana**
 > Open Grafana → Explore → select the Prometheus datasource.
-> Run the query: `pve_up` — you should see a metric per Proxmox node (pve1, pve2, pve3, pve4) all returning 1.
+> Run the query: `pve_up` — you should see a metric per Proxmox node (pve, pve2, pve3, pve4) all returning 1.
 > Open the Proxmox dashboard (imported in Step 7.8) — verify CPU, memory, and storage panels are populated.
 > If no `pve_` metrics appear: check `kubectl get servicemonitor -n monitoring` includes `pve-exporter`; check that the Prometheus scrape config is picking it up via `kubectl logs -n monitoring -l app=pve-exporter`.
 
@@ -1174,7 +1184,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 | OpenTofu for_each | https://opentofu.org/docs/language/meta-arguments/for_each/ |
 | OpenTofu S3 backend (MinIO) | https://opentofu.org/docs/language/settings/backends/s3/ |
 | OpenTofu tofu show | https://opentofu.org/docs/cli/commands/show/ |
-| Terraform GitHub Actions (workflow reference) | https://developer.hashicorp.com/terraform/tutorials/automation/github-actions |
+| OpenTofu GitHub Actions (workflow reference) | https://opentofu.org/docs/intro/use-cases/ |
 | GitHub self-hosted runners | https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners |
 | GitHub Environments (approval gates) | https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment |
 | GitHub repository_dispatch | https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event |
