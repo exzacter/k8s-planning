@@ -366,7 +366,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > 1. Sign up at https://www.backblaze.com/sign-up/cloud-storage — free tier includes 10 GB; beyond that ~$6/TB/month
 > 2. Create a private bucket named `k8s-velero-offsite`
 > 3. Create an application key scoped to that bucket only — note the `keyID` and `applicationKey`
-> 4. Note your bucket's region from the B2 UI — the S3 endpoint format is `https://s3.<region>.backblazeb2.com`
+> 4. Select **US West** region when creating the bucket — closest to Australia via transpacific cable, best upload throughput. S3 endpoint: `https://s3.us-west-004.backblazeb2.com`
 > 5. Store both in KeePassXC for now — they go into OpenBao in Step 7d.3 once OpenBao exists
 
 ---
@@ -694,7 +694,7 @@ These tools are only needed on your developer machine for the one-time bootstrap
 > An ArgoCD `Application` pointing to the Velero Helm chart deployed to the `velero` namespace.
 > Configure **two** `BackupStorageLocation` resources — this is what gives you 3-2-1:
 > - `local` (default): MinIO on Proxmox (`http://192.168.1.60:9000`) — fast local restore, same site
-> - `offsite`: Backblaze B2 — S3-compatible endpoint (`https://s3.<your-region>.backblazeb2.com` — find your region in the B2 UI), different physical location
+> - `offsite`: Backblaze B2 — S3-compatible endpoint (`https://s3.us-west-004.backblazeb2.com`), different physical location
 >
 > Both locations receive every backup. Velero supports multiple storage locations natively — set `default: true` on the MinIO location so restores default to local (faster), with B2 available as the DR target.
 > A `Schedule` CRD triggers a daily full backup at 02:00 with 7-day retention, writing to both locations.
